@@ -22,7 +22,9 @@ $(BUILD):
 
 sim: | $(BUILD)
 	iverilog -g2012 -o $(BUILD)/tb.vvp sim/tb_basys3_top.v $(RTL)
-	vvp $(BUILD)/tb.vvp
+	vvp $(BUILD)/tb.vvp | tee $(BUILD)/sim.log
+	@# the testbench always calls $$finish, so judge it by its PASS line
+	@grep -q '^PASS' $(BUILD)/sim.log
 
 $(BUILD)/host_test: test/host_test.c $(DRV) $(DRVH) | $(BUILD)
 	gcc -std=c11 -Wall -Wextra -Werror -DFPGA_LINK_HOST_TEST -Itest -I$(FW)/Core/Inc \

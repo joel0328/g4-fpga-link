@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: RTL sim + driver replay
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Icarus Verilog
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends iverilog
+      - name: make test
+        run: make test
+
+  firmware:
+    name: Firmware build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Arm GNU toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi libnewlib-arm-none-eabi
+          arm-none-eabi-gcc --version | head -1
+      - name: Build
+        run: make -C firmware/FPGA_Link
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FPGA_Link-firmware
+          path: |
+            firmware/FPGA_Link/build/FPGA_Link.bin
+            firmware/FPGA_Link/build/FPGA_Link.hex
+            firmware/FPGA_Link/build/FPGA_Link.elf
+            firmware/FPGA_Link/build/FPGA_Link.map

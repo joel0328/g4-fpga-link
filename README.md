@@ -1,5 +1,7 @@
 # fpga_link
 
+[![CI](https://github.com/joel0328/g4-fpga-link/actions/workflows/ci.yml/badge.svg)](https://github.com/joel0328/g4-fpga-link/actions/workflows/ci.yml)
+
 SPI register link between a **Nucleo-G431KB** and a **Basys 3**: the STM32 reads
 and writes FPGA registers over SPI with a CRC on every frame, plus an FPGA loop
 tick and an interrupt line. This is the FPGA side, the STM32 firmware, the tests
@@ -46,6 +48,10 @@ scripts/                    Vivado build/program, STM32 flash, serial check
 test/                       builds the STM32 driver on a PC for the replay test
 Makefile                    make test / make firmware
 ```
+
+`make test` (Icarus Verilog + a host C compiler) runs the RTL testbench and the
+driver↔RTL replay. On Windows, run it from Git Bash. CI runs it and the
+firmware build on every push.
 
 ## Register map (version 1)
 
