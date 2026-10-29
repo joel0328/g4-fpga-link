@@ -81,3 +81,9 @@ Makefile                    make test / make firmware
 - Frames cut short by releasing CS are discarded.
 - Unmapped reads return 0xDEADBEEF. Incompatible changes bump VERSION, and
   the driver's `fpga_init` refuses a mismatch.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The vendored ST code under
+`firmware/FPGA_Link/Drivers/` keeps its own licenses: STM32G4 HAL is
+BSD-3-Clause, CMSIS is Apache-2.0 (see the `LICENSE.md` in each folder).
