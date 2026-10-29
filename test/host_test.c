@@ -1,0 +1,134 @@
+/*
+ * host_test.c - checks the STM32 driver against the RTL without hardware.
+ *
+ *   ./host_test record frames.hex   writes the MOSI bytes the driver sends
+ *                                   for a fixed transaction script
+ *   (tb_replay.v plays frames.hex into the RTL and writes miso.hex)
+ *   ./host_test check miso.hex      feeds the FPGA's MISO bytes back through
+ *                                   the driver and checks every result
+ *
+ * Also checks the CRC-8 against the standard check value.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fpga_link.h"
+
+/* ---------------- HAL stub ---------------- */
+static FILE *rec_file;          /* record mode: MOSI bytes out          */
+static uint8_t miso_buf[4096];  /* check mode: MISO bytes in            */
+static size_t  miso_len, miso_pos;
+static int     cs_low_count;
+
+HAL_StatusTypeDef HAL_SPI_TransmitReceive(SPI_HandleTypeDef *h, uint8_t *tx,
+                                          uint8_t *rx, uint16_t len,
+                                          uint32_t timeout)
+{
+    (void)h; (void)timeout;
+    if (rec_file) {
+        fprintf(rec_file, "%02X", len);   /* frame length, then bytes */
+        for (uint16_t i = 0; i < len; i++)
+            fprintf(rec_file, " %02X", tx[i]);
+        fprintf(rec_file, "\n");
+        memset(rx, 0, len);
+        return HAL_OK;
+    }
+    if (miso_pos + len > miso_len)
+        return HAL_TIMEOUT;
+    memcpy(rx, &miso_buf[miso_pos], len);
+    miso_pos += len;
+    return HAL_OK;
+}
+
+void HAL_GPIO_WritePin(GPIO_TypeDef *p, uint16_t pin, GPIO_PinState s)
+{
+    (void)p; (void)pin;
+    if (s == GPIO_PIN_RESET) cs_low_count++;
+}
+void     HAL_Delay(uint32_t ms) { (void)ms; }
+uint32_t HAL_GetTick(void) { return 0; }
+
+/* ---------------- transaction script ---------------- */
+static int failures;
+#define EXPECT(cond, ...) do { if (!(cond)) { failures++; printf("FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
+
+static SPI_HandleTypeDef hspi;
+static GPIO_TypeDef cs_port;
+
+static void script(int checking)
+{
+    fpga_link_t l = { .hspi = &hspi, .cs_port = &cs_port, .cs_pin = 1,
+                      .rst_port = NULL, .retries = 0 };
+    uint32_t v = 0;
+    fpga_status_t st;
+
+    /* 1. ID and version */
+    st = fpga_read(&l, FPGA_REG_ID, &v);
+    if (checking) EXPECT(st == FPGA_OK && v == FPGA_ID_VALUE, "ID read: st=%d v=%08X", st, v);
+    st = fpga_read(&l, FPGA_REG_VERSION, &v);
+    if (checking) EXPECT(st == FPGA_OK && v == FPGA_MAP_VERSION, "VERSION read: st=%d v=%08X", st, v);
+
+    /* 2. Scratch patterns */
+    const uint32_t pats[] = { 0xCAFEF00Du, 0x00000000u, 0xFFFFFFFFu, 0x80000001u, 0x5A5AA5A5u };
+    for (size_t i = 0; i < sizeof pats / sizeof pats[0]; i++) {
+        fpga_write(&l, FPGA_REG_SCRATCH, pats[i]);
+        st = fpga_read(&l, FPGA_REG_SCRATCH, &v);
+        if (checking) EXPECT(st == FPGA_OK && v == pats[i], "SCRATCH %08X: st=%d v=%08X", pats[i], st, v);
+    }
+
+    /* 3. LEDs */
+    fpga_write(&l, FPGA_REG_LEDS, 0x0000A5C3u);
+    st = fpga_read(&l, FPGA_REG_LEDS, &v);
+    if (checking) EXPECT(st == FPGA_OK && v == 0xA5C3u, "LEDS: st=%d v=%08X", st, v);
+
+    /* 4. Unmapped */
+    st = fpga_read(&l, 0x7F, &v);
+    if (checking) EXPECT(st == FPGA_OK && v == FPGA_UNMAPPED_VALUE, "unmapped: st=%d v=%08X", st, v);
+
+    /* 5. Frame counter: 2 + 10 + 2 + 1 = 15 good frames so far, read latched
+          before this frame counts itself */
+    st = fpga_read(&l, FPGA_REG_FRAMES_OK, &v);
+    if (checking) EXPECT(st == FPGA_OK && v == 15u, "FRAMES_OK: st=%d v=%lu (expected 15)", st, (unsigned long)v);
+
+    st = fpga_read(&l, FPGA_REG_CRC_ERRS, &v);
+    if (checking) EXPECT(st == FPGA_OK && v == 0u, "CRC_ERRS: st=%d v=%lu", st, (unsigned long)v);
+}
+
+static int load_miso(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    unsigned b;
+    if (!f) { perror(path); return -1; }
+    while (fscanf(f, "%x", &b) == 1 && miso_len < sizeof miso_buf)
+        miso_buf[miso_len++] = (uint8_t)b;
+    fclose(f);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    /* CRC-8/SMBUS check value */
+    const uint8_t chk[] = "123456789";
+    uint8_t c = fpga_crc8(0, chk, 9);
+    EXPECT(c == 0xF4, "CRC-8 check value %02X != F4", c);
+
+    /* Known frame: write SCRATCH = CAFEF00D -> header 02 */
+    uint8_t fr[5] = { 0x02, 0xCA, 0xFE, 0xF0, 0x0D };
+    printf("CRC of write(0x02, 0xCAFEF00D) frame: %02X\n", fpga_crc8(0, fr, 5));
+
+    if (argc == 3 && strcmp(argv[1], "record") == 0) {
+        rec_file = fopen(argv[2], "w");
+        if (!rec_file) { perror(argv[2]); return 2; }
+        script(0);
+        fclose(rec_file);
+        printf("recorded %d frames to %s\n", cs_low_count, argv[2]);
+    } else if (argc == 3 && strcmp(argv[1], "check") == 0) {
+        if (load_miso(argv[2])) return 2;
+        script(1);
+        EXPECT(miso_pos == miso_len, "consumed %zu of %zu MISO bytes", miso_pos, miso_len);
+        printf("checked %zu MISO bytes from the RTL\n", miso_len);
+    }
+
+    printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
+    return failures ? 1 : 0;
+}

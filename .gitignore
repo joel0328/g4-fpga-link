@@ -1,0 +1,14 @@
+build/
+firmware/FPGA_Link/build/
+firmware/FPGA_Link/Debug/
+firmware/FPGA_Link/Release/
+*.su
+__pycache__/
+.Xil/
+*.jou
+*.log
+clockInfo.txt
+dfx_runtime.txt
+
+# Local assistant notes, kept private
+CLAUDE.md

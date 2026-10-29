@@ -1,0 +1,8 @@
+# Keep LF everywhere (sources are LF; the project also builds on Linux)
+* text=auto eol=lf
+
+# Firmware images: never convert
+*.bin binary
+*.elf binary
+*.hex -text
+*.bit binary
