@@ -8,7 +8,7 @@
 
 Needs pyserial (pip install pyserial). Writes everything to build/serial.log
 and ends with a RESULT line:
-  OK      - init OK, self-test clean, ticks counting, no CRC errors
+  OK      - init OK, both self-tests clean, ticks counting, no CRC errors
   PARTIAL - some checks passed (details listed)
   FAILED  - no output, or init failed
 Without --reset you only see the init/self-test lines if you press the
@@ -64,25 +64,43 @@ def reset_mcu():
     return True
 
 
+SELFTESTS = (("single", "Self-test:", "Self-test 10,000 write/readback pairs"),
+             ("burst", "Burst self-test:", "Burst self-test 2,000 x 16-word bursts"))
+
+
+def parse_selftests(lines):
+    """Last result line under each self-test header, keyed by kind."""
+    found, kind = {}, None
+    for l in lines:
+        header = next((k for k, prefix, _ in SELFTESTS if l.startswith(prefix)), None)
+        if header:
+            kind = header
+            continue
+        m = SELFTEST_RE.match(l)
+        if m and kind:
+            found[kind] = m
+    return found
+
+
 def judge(lines):
     init_ok = any(l.strip() == "Init: OK" for l in lines)
     init_fail = [l.strip() for l in lines if l.startswith("Init: ") and l.strip() != "Init: OK"]
-    selftests = [SELFTEST_RE.match(l) for l in lines]
-    selftests = [m for m in selftests if m]
+    selftests = parse_selftests(lines)
     ticks = [TICK_RE.search(l) for l in lines]
     ticks = [m for m in ticks if m]
 
     checks = []
     checks.append(("FPGA answered (ID + map version)", init_ok,
                    init_fail[-1] if init_fail else ("" if init_ok else "no 'Init:' line seen")))
-    if selftests:
-        m = selftests[-1]
-        clean = m.group(1) == "OK" and all(int(m.group(i)) == 0 for i in (4, 5, 6, 7))
-        checks.append(("Self-test 10,000 write/readback pairs", clean,
-                       f"{m.group(1)}, mismatches {m.group(4)}, MCU CRC {m.group(5)}, "
-                       f"FPGA CRC {m.group(6)}, SPI {m.group(7)}"))
-    else:
-        checks.append(("Self-test 10,000 write/readback pairs", False, "no self-test line seen"))
+    for kind, _, name in SELFTESTS:
+        m = selftests.get(kind)
+        if m:
+            clean = m.group(1) == "OK" and all(int(m.group(i)) == 0 for i in (4, 5, 6, 7))
+            checks.append((name, clean,
+                           f"{m.group(1)}, mismatches {m.group(4)}, MCU CRC {m.group(5)}, "
+                           f"FPGA CRC {m.group(6)}, SPI {m.group(7)}"))
+        else:
+            checks.append((name, False, "no result line seen"))
 
     if len(ticks) >= 2:
         a, b = ticks[0], ticks[-1]
@@ -107,7 +125,7 @@ def judge(lines):
     if not lines:
         return "FAILED - no serial output (wrong port, firmware not running, or 115200 baud mismatch)"
     if all(ok for _, ok, _ in checks):
-        return "OK - link up, self-test clean, ticks counting, no CRC errors"
+        return "OK - link up, self-tests clean, ticks counting, no CRC errors"
     if not init_ok and not ticks:
         return "FAILED - FPGA did not answer; see the checks above and the troubleshooting table"
     return "PARTIAL - " + "; ".join(n for n, ok, _ in checks if not ok) + " failed"

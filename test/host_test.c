@@ -81,8 +81,8 @@ static void script(int checking)
     st = fpga_read(&l, FPGA_REG_LEDS, &v);
     if (checking) EXPECT(st == FPGA_OK && v == 0xA5C3u, "LEDS: st=%d v=%08X", st, v);
 
-    /* 4. Unmapped */
-    st = fpga_read(&l, 0x7F, &v);
+    /* 4. Unmapped (0x7F is the burst escape, so 0x7E) */
+    st = fpga_read(&l, 0x7E, &v);
     if (checking) EXPECT(st == FPGA_OK && v == FPGA_UNMAPPED_VALUE, "unmapped: st=%d v=%08X", st, v);
 
     /* 5. Frame counter: 2 + 10 + 2 + 1 = 15 good frames so far, read latched
@@ -92,6 +92,31 @@ static void script(int checking)
 
     st = fpga_read(&l, FPGA_REG_CRC_ERRS, &v);
     if (checking) EXPECT(st == FPGA_OK && v == 0u, "CRC_ERRS: st=%d v=%lu", st, (unsigned long)v);
+
+    /* 6. Bursts: 16 words through SCRATCH_RAM, ID + VERSION in one frame */
+    uint32_t wr[FPGA_BURST_MAX], rd[FPGA_BURST_MAX] = {0};
+    for (uint32_t i = 0; i < FPGA_BURST_MAX; i++)
+        wr[i] = (0x01020304u * (i + 1u)) ^ 0xA5A5A5A5u;
+    st = fpga_write_burst(&l, FPGA_REG_SCRATCH_RAM, wr, FPGA_BURST_MAX);
+    if (checking) EXPECT(st == FPGA_OK, "burst write: st=%d", st);
+    st = fpga_read_burst(&l, FPGA_REG_SCRATCH_RAM, rd, FPGA_BURST_MAX);
+    if (checking) EXPECT(st == FPGA_OK && memcmp(rd, wr, sizeof wr) == 0,
+                         "burst read x16: st=%d rd[0]=%08X rd[15]=%08X", st, rd[0], rd[15]);
+    st = fpga_read(&l, FPGA_REG_SCRATCH_RAM + 15u, &v);
+    if (checking) EXPECT(st == FPGA_OK && v == wr[15], "RAM[15] single read: st=%d v=%08X", st, v);
+    st = fpga_read_burst(&l, FPGA_REG_ID, rd, 2);
+    if (checking) EXPECT(st == FPGA_OK && rd[0] == FPGA_ID_VALUE && rd[1] == FPGA_MAP_VERSION,
+                         "burst ID+VERSION: st=%d %08X %08X", st, rd[0], rd[1]);
+
+    /* 7. Bad arguments are refused without sending a frame */
+    st = fpga_read_burst(&l, FPGA_REG_SCRATCH_RAM, rd, 0);
+    if (checking) EXPECT(st == FPGA_ERR_PARAM, "burst count 0: st=%d", st);
+    st = fpga_write_burst(&l, FPGA_REG_SCRATCH_RAM, wr, FPGA_BURST_MAX + 1u);
+    if (checking) EXPECT(st == FPGA_ERR_PARAM, "burst count 17: st=%d", st);
+    st = fpga_read(&l, FPGA_BURST_ADDR, &v);
+    if (checking) EXPECT(st == FPGA_ERR_PARAM, "single read of 0x7F: st=%d", st);
+    st = fpga_write(&l, FPGA_BURST_ADDR, 0);
+    if (checking) EXPECT(st == FPGA_ERR_PARAM, "single write of 0x7F: st=%d", st);
 }
 
 static int load_miso(const char *path)

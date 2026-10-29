@@ -62,12 +62,29 @@ static fpga_status_t xfer(fpga_link_t *l, const uint8_t *tx, uint8_t *rx,
     return FPGA_OK;
 }
 
+static void put_be32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+static uint32_t get_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+}
+
 /* ------------------------------------------------------------------------ */
 /* Register access                                                          */
 /* ------------------------------------------------------------------------ */
 fpga_status_t fpga_write(fpga_link_t *l, uint8_t addr, uint32_t value)
 {
     uint8_t tx[6], rx[6];
+
+    if ((addr & 0x7Fu) == FPGA_BURST_ADDR)   /* the burst escape, not a register */
+        return FPGA_ERR_PARAM;
 
     tx[0] = addr & 0x7Fu;
     tx[1] = (uint8_t)(value >> 24);
@@ -85,6 +102,9 @@ fpga_status_t fpga_read(fpga_link_t *l, uint8_t addr, uint32_t *value)
     uint8_t tx[7] = {0}, rx[7];
     fpga_status_t st = FPGA_ERR_CRC;
 
+    if ((addr & 0x7Fu) == FPGA_BURST_ADDR)
+        return FPGA_ERR_PARAM;
+
     tx[0] = 0x80u | (addr & 0x7Fu);
     tx[1] = fpga_crc8(0, tx, 1);
 
@@ -95,8 +115,69 @@ fpga_status_t fpga_read(fpga_link_t *l, uint8_t addr, uint32_t *value)
             continue;
 
         if (fpga_crc8(0, &rx[2], 4) == rx[6]) {
-            *value = ((uint32_t)rx[2] << 24) | ((uint32_t)rx[3] << 16) |
-                     ((uint32_t)rx[4] << 8)  |  (uint32_t)rx[5];
+            *value = get_be32(&rx[2]);
+            return FPGA_OK;
+        }
+        l->crc_errors++;
+        st = FPGA_ERR_CRC;
+    }
+    return st;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Burst access (map version 2)                                             */
+/*   [0x7F | 0x80 for read] [start addr] [N-1] [CRC(0..2)] data... [CRC]    */
+/* ------------------------------------------------------------------------ */
+#define BURST_HDR_LEN   4u
+#define BURST_FRAME_MAX (BURST_HDR_LEN + 4u * FPGA_BURST_MAX + 1u)
+
+static void burst_header(uint8_t *tx, uint8_t hdr, uint8_t addr, uint32_t count)
+{
+    tx[0] = hdr;
+    tx[1] = addr & 0x7Fu;
+    tx[2] = (uint8_t)(count - 1u);
+    tx[3] = fpga_crc8(0, tx, 3);
+}
+
+fpga_status_t fpga_write_burst(fpga_link_t *l, uint8_t addr,
+                               const uint32_t *values, uint32_t count)
+{
+    uint8_t tx[BURST_FRAME_MAX], rx[BURST_FRAME_MAX];
+    uint32_t data_len = 4u * count;
+
+    if (count == 0u || count > FPGA_BURST_MAX)
+        return FPGA_ERR_PARAM;
+
+    burst_header(tx, FPGA_BURST_ADDR, addr, count);
+    for (uint32_t i = 0; i < count; i++)
+        put_be32(&tx[BURST_HDR_LEN + 4u * i], values[i]);
+    tx[BURST_HDR_LEN + data_len] = fpga_crc8(0, &tx[BURST_HDR_LEN], data_len);
+
+    l->writes++;
+    return xfer(l, tx, rx, (uint16_t)(BURST_HDR_LEN + data_len + 1u));
+}
+
+fpga_status_t fpga_read_burst(fpga_link_t *l, uint8_t addr,
+                              uint32_t *values, uint32_t count)
+{
+    uint8_t tx[BURST_FRAME_MAX] = {0}, rx[BURST_FRAME_MAX];
+    uint32_t data_len = 4u * count;
+    fpga_status_t st = FPGA_ERR_CRC;
+
+    if (count == 0u || count > FPGA_BURST_MAX)
+        return FPGA_ERR_PARAM;
+
+    burst_header(tx, 0x80u | FPGA_BURST_ADDR, addr, count);
+
+    for (uint32_t attempt = 0; attempt <= l->retries; attempt++) {
+        l->reads++;
+        st = xfer(l, tx, rx, (uint16_t)(BURST_HDR_LEN + data_len + 1u));
+        if (st != FPGA_OK)
+            continue;
+
+        if (fpga_crc8(0, &rx[BURST_HDR_LEN], data_len) == rx[BURST_HDR_LEN + data_len]) {
+            for (uint32_t i = 0; i < count; i++)
+                values[i] = get_be32(&rx[BURST_HDR_LEN + 4u * i]);
             return FPGA_OK;
         }
         l->crc_errors++;
@@ -182,6 +263,23 @@ static uint32_t xorshift32(uint32_t *s)
     return *s = x;
 }
 
+/* Common end of both self-tests: timing, error counts and the verdict */
+static fpga_status_t selftest_finish(fpga_link_t *l, fpga_selftest_t *r,
+                                     uint32_t start, uint32_t base_crc,
+                                     uint32_t base_spi)
+{
+    r->elapsed_ms = HAL_GetTick() - start;
+    r->crc_errors = l->crc_errors - base_crc;
+    r->spi_errors = l->spi_errors - base_spi;
+    r->fpga_crc_errors = 0;
+    fpga_read(l, FPGA_REG_CRC_ERRS, &r->fpga_crc_errors);
+
+    if (r->spi_errors)                       return FPGA_ERR_SPI;
+    if (r->crc_errors || r->fpga_crc_errors) return FPGA_ERR_CRC;
+    if (r->mismatches)                       return FPGA_ERR_VERIFY;
+    return FPGA_OK;
+}
+
 fpga_status_t fpga_selftest(fpga_link_t *l, uint32_t iterations,
                             fpga_selftest_t *r)
 {
@@ -215,20 +313,44 @@ fpga_status_t fpga_selftest(fpga_link_t *l, uint32_t iterations,
                        FPGA_SEG7_USE_REG | FPGA_SEG7_ALL_DIGITS | ((i >> 10) & 0xFFFFu));
     }
 
-    l->retries = saved_retries;
-    r->elapsed_ms = HAL_GetTick() - start;
-    r->crc_errors = l->crc_errors - base_crc;
-    r->spi_errors = l->spi_errors - base_spi;
-    r->fpga_crc_errors = 0;
-    fpga_read(l, FPGA_REG_CRC_ERRS, &r->fpga_crc_errors);
-
     /* Hand the display back to the frame counter */
     fpga_write(l, FPGA_REG_SEG7, 0);
 
-    if (r->spi_errors)                    return FPGA_ERR_SPI;
-    if (r->crc_errors || r->fpga_crc_errors) return FPGA_ERR_CRC;
-    if (r->mismatches)                    return FPGA_ERR_VERIFY;
-    return FPGA_OK;
+    l->retries = saved_retries;
+    return selftest_finish(l, r, start, base_crc, base_spi);
+}
+
+fpga_status_t fpga_selftest_burst(fpga_link_t *l, uint32_t iterations,
+                                  fpga_selftest_t *r)
+{
+    uint32_t seed = 0x89ABCDEFu;
+    uint32_t base_crc = l->crc_errors;
+    uint32_t base_spi = l->spi_errors;
+    uint32_t start = HAL_GetTick();
+    uint32_t wr[FPGA_BURST_MAX], rd[FPGA_BURST_MAX];
+
+    r->iterations = 0;
+    r->mismatches = 0;
+
+    uint8_t saved_retries = l->retries;
+    l->retries = 0;
+
+    fpga_write(l, FPGA_REG_CTRL, FPGA_CTRL_CLEAR_COUNTERS);
+
+    for (uint32_t i = 0; i < iterations; i++) {
+        for (uint32_t w = 0; w < FPGA_BURST_MAX; w++)
+            wr[w] = xorshift32(&seed);
+        if (fpga_write_burst(l, FPGA_REG_SCRATCH_RAM, wr, FPGA_BURST_MAX) != FPGA_OK)
+            continue;
+        if (fpga_read_burst(l, FPGA_REG_SCRATCH_RAM, rd, FPGA_BURST_MAX) == FPGA_OK)
+            for (uint32_t w = 0; w < FPGA_BURST_MAX; w++)
+                if (rd[w] != wr[w])
+                    r->mismatches++;
+        r->iterations++;
+    }
+
+    l->retries = saved_retries;
+    return selftest_finish(l, r, start, base_crc, base_spi);
 }
 
 const char *fpga_status_str(fpga_status_t s)
@@ -240,6 +362,7 @@ const char *fpga_status_str(fpga_status_t s)
     case FPGA_ERR_VERIFY:  return "readback mismatch";
     case FPGA_ERR_ID:      return "bad ID (no bitstream, or wiring)";
     case FPGA_ERR_VERSION: return "register map version mismatch";
+    case FPGA_ERR_PARAM:   return "bad argument";
     default:               return "unknown";
     }
 }

@@ -53,12 +53,12 @@ Makefile                    make test / make firmware
 driver↔RTL replay. On Windows, run it from Git Bash. CI runs it and the
 firmware build on every push.
 
-## Register map (version 1)
+## Register map (version 2)
 
 | Addr | Name | Access | Description |
 |---|---|---|---|
 | 0x00 | ID | RO | 0x47344650 ("G4FP") |
-| 0x01 | VERSION | RO | 1 |
+| 0x01 | VERSION | RO | 2 |
 | 0x02 | SCRATCH | RW | Link test register |
 | 0x03 | LEDS | RW | [15:0] LEDs |
 | 0x04 | SWITCHES | RO | [15:0] switches, [20:16] buttons U, L, R, D, C (debounced) |
@@ -71,6 +71,8 @@ firmware build on every push.
 | 0x0B | CRC_ERRS | RO | Rejected frames |
 | 0x0C | TIME_US | RO | Free-running microsecond timestamp |
 | 0x0D | CTRL | W | [0] clear FRAMES_OK, CRC_ERRS and TICK_COUNT |
+| 0x10–0x1F | SCRATCH_RAM | RW | 16 free words (burst self-test) |
+| 0x7F | — | — | Reserved: the burst escape in the frame header, never a register |
 
 ## Protocol
 
@@ -84,6 +86,15 @@ firmware build on every push.
 - Read, 7 bytes: MOSI `[1|addr7] [CRC(byte0)] 00 00 00 00 00`; MISO data in
   bytes 2–5, CRC over the data in byte 6. A bad header CRC returns FFFFFFFF
   with an inverted CRC.
+- Burst write, 5 + 4N bytes (N = 1–16):
+  `[0x7F] [start addr] [N-1] [CRC(0..2)] [N × 4 data bytes] [CRC(data)]`.
+  All-or-nothing: the words are written only if both CRCs match. A rejected
+  burst is counted once in CRC_ERRS.
+- Burst read, 5 + 4N bytes: MOSI `[0xFF] [start addr] [N-1] [CRC(0..2)] 00 …`;
+  MISO carries the N words from byte 4 on, then a CRC over all data bytes.
+  A bad header CRC or N > 16 returns all-FF data with an inverted CRC.
+- Burst addresses increment from the start address and wrap at 0x7F. A burst
+  counts as one frame in FRAMES_OK.
 - Frames cut short by releasing CS are discarded.
 - Unmapped reads return 0xDEADBEEF. Incompatible changes bump VERSION, and
   the driver's `fpga_init` refuses a mismatch.

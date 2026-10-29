@@ -156,6 +156,120 @@ module tb_basys3_top;
     endtask
 
     // ------------------------------------------------------------------
+    // Burst frames (map version 2)
+    // ------------------------------------------------------------------
+    reg [31:0] bw   [0:15];   // words to burst-write
+    reg [31:0] br   [0:15];   // words from the last burst read
+    reg [31:0] bref [0:15];   // saved copy for "unchanged" checks
+
+    // Burst write of n words from bw[]. cnt_byte is sent as N-1 (pass n-1
+    // unless testing rejection). cut_after > 0 releases CS once that many
+    // bytes (header included) have gone out.
+    task burst_write(input [6:0] start, input integer n, input [7:0] cnt_byte,
+                     input bad_hdr, input bad_data, input integer cut_after);
+        reg [7:0] crc, rx, b;
+        integer w, j, sent;
+        begin
+            crc = crc8(crc8(crc8(8'h00, 8'h7F), {1'b0, start}), cnt_byte);
+            if (bad_hdr) crc = crc ^ 8'h01;
+            cs_begin;
+            spi_byte(8'h7F, rx);
+            spi_byte({1'b0, start}, rx);
+            spi_byte(cnt_byte, rx);
+            spi_byte(crc, rx);
+            sent = 4;
+            crc = 8'h00;
+            for (w = 0; w < n; w = w + 1)
+                for (j = 3; j >= 0; j = j - 1) begin
+                    b = bw[w] >> (8 * j);
+                    crc = crc8(crc, b);
+                    if (cut_after == 0 || sent < cut_after) spi_byte(b, rx);
+                    sent = sent + 1;
+                end
+            if (bad_data) crc = crc ^ 8'h01;
+            if (cut_after == 0 || sent < cut_after) spi_byte(crc, rx);
+            cs_end;
+        end
+    endtask
+
+    // Burst read of n words into br[]; crc_ok says whether the data CRC matched
+    task burst_read(input [6:0] start, input integer n, input [7:0] cnt_byte,
+                    input bad_hdr, output crc_ok);
+        reg [7:0] crc, rx, calc;
+        reg [31:0] word;
+        integer w, j;
+        begin
+            crc = crc8(crc8(crc8(8'h00, 8'hFF), {1'b0, start}), cnt_byte);
+            if (bad_hdr) crc = crc ^ 8'h80;
+            cs_begin;
+            spi_byte(8'hFF, rx);
+            spi_byte({1'b0, start}, rx);
+            spi_byte(cnt_byte, rx);
+            spi_byte(crc, rx);
+            calc = 8'h00;
+            for (w = 0; w < n; w = w + 1) begin
+                for (j = 0; j < 4; j = j + 1) begin
+                    spi_byte(8'h00, rx);
+                    word = {word[23:0], rx};
+                    calc = crc8(calc, rx);
+                end
+                br[w] = word;
+            end
+            spi_byte(8'h00, rx);
+            crc_ok = (rx == calc);
+            cs_end;
+        end
+    endtask
+
+    task burst_suite(input [31:0] seed);
+        reg [31:0] d, f0;
+        reg ok;
+        integer i;
+        begin
+            // 16 words through SCRATCH_RAM
+            for (i = 0; i < 16; i = i + 1)
+                bw[i] = (32'h9E37_79B9 * (i + 1)) ^ seed;
+            reg_read(7'h0A, 1'b0, f0, ok);
+            burst_write(7'h10, 16, 8'd15, 1'b0, 1'b0, 0);
+            burst_read(7'h10, 16, 8'd15, 1'b0, ok);
+            check("burst read x16 (crc)", {31'h0, ok}, 32'h1);
+            for (i = 0; i < 16; i = i + 1)
+                check("burst RAM word", br[i], bw[i]);
+            read_expect("RAM[0] by single read", 7'h10, bw[0]);
+            read_expect("RAM[15] by single read", 7'h1F, bw[15]);
+            reg_read(7'h0A, 1'b0, d, ok);
+            // f0's own read, burst write, burst read, two single reads
+            check("FRAMES_OK counts a burst as one frame", d - f0, 32'd5);
+
+            // Burst across ordinary registers: SCRATCH then LEDS
+            bw[0] = 32'h0BAD_CAFE ^ seed;
+            bw[1] = 32'h0000_3C3C;
+            burst_write(7'h02, 2, 8'd1, 1'b0, 1'b0, 0);
+            #20;
+            check("LED pins by burst write", {16'h0, led}, 32'h0000_3C3C);
+            read_expect("SCRATCH by burst write", 7'h02, bw[0]);
+
+            // N = 1
+            burst_read(7'h02, 1, 8'd0, 1'b0, ok);
+            check("burst read x1 (crc)", {31'h0, ok}, 32'h1);
+            check("burst read x1", br[0], bw[0]);
+
+            // ID + VERSION in one frame
+            burst_read(7'h00, 2, 8'd1, 1'b0, ok);
+            check("burst ID+VERSION (crc)", {31'h0, ok}, 32'h1);
+            check("burst ID", br[0], 32'h4734_4650);
+            check("burst VERSION", br[1], 32'h0000_0002);
+
+            // Addresses wrap: 0x7E, 0x7F, 0x00
+            burst_read(7'h7E, 3, 8'd2, 1'b0, ok);
+            check("burst wrap (crc)", {31'h0, ok}, 32'h1);
+            check("burst wrap 0x7E", br[0], 32'hDEAD_BEEF);
+            check("burst wrap 0x7F", br[1], 32'hDEAD_BEEF);
+            check("burst wrap 0x00", br[2], 32'h4734_4650);
+        end
+    endtask
+
+    // ------------------------------------------------------------------
     // Link test at one SPI speed
     // ------------------------------------------------------------------
     task link_suite(input real hp, input real delay);
@@ -168,7 +282,7 @@ module tb_basys3_top;
             $display("SPI %.1f MHz, MISO delay %.0f ns", 1000.0 / (2.0 * hp), delay);
 
             read_expect("ID", 7'h00, 32'h4734_4650);
-            read_expect("VERSION", 7'h01, 32'h0000_0001);
+            read_expect("VERSION", 7'h01, 32'h0000_0002);
 
             // Scratch: walking patterns
             for (i = 0; i < 32; i = i + 1) begin
@@ -187,8 +301,8 @@ module tb_basys3_top;
             check("LED pins", {16'h0, led}, 32'h0000_A5C3);
             read_expect("LEDS", 7'h03, 32'h0000_A5C3);
 
-            // Unmapped address
-            read_expect("unmapped", 7'h7F, 32'hDEAD_BEEF);
+            // Unmapped address (0x7F is the burst escape, so use 0x7E)
+            read_expect("unmapped", 7'h7E, 32'hDEAD_BEEF);
 
             // Frame counter increases by exactly the number of good frames
             reg_read(7'h0A, 1'b0, frames_before, ok);
@@ -198,6 +312,8 @@ module tb_basys3_top;
             // the first read itself, two writes, and this read's own frame
             // completes after its data is latched, so it is not counted yet
             check("FRAMES_OK delta", d - frames_before, 32'd3);
+
+            burst_suite(32'hC0FF_EE00 ^ $rtoi(hp * 1000.0));   // new data per speed
         end
     endtask
 
@@ -208,6 +324,7 @@ module tb_basys3_top;
     reg ok;
     integer pulses;
     integer pulse_width;
+    integer i;
 
     always @(posedge tick) pulses = pulses + 1;
 
@@ -254,6 +371,43 @@ module tb_basys3_top;
         // A good frame still works right after the errors
         reg_write(7'h02, 32'h600D_600D, 1'b0);
         read_expect("SCRATCH after recovery", 7'h02, 32'h600D_600D);
+
+        // Burst errors: nothing may be written, each rejected frame counts once
+        $display("Burst error handling");
+        for (i = 0; i < 16; i = i + 1) begin
+            bw[i]   = 32'h1111_0000 + i;
+            bref[i] = bw[i];
+        end
+        burst_write(7'h10, 16, 8'd15, 1'b0, 1'b0, 0);   // known RAM contents
+        reg_read(7'h0B, 1'b0, prev_cnt, ok);
+        for (i = 0; i < 16; i = i + 1)
+            bw[i] = 32'hBAD0_0000 + i;
+        burst_write(7'h10, 16, 8'd15, 1'b0, 1'b1, 0);   // bad data CRC
+        burst_write(7'h10, 16, 8'd15, 1'b1, 1'b0, 0);   // bad header CRC
+        burst_write(7'h10, 16, 8'h10, 1'b0, 1'b0, 0);   // N = 17
+        burst_write(7'h10, 16, 8'd15, 1'b0, 1'b0, 20);  // cut mid-data
+        burst_write(7'h10, 16, 8'd15, 1'b0, 1'b0, 68);  // cut before the data CRC
+        reg_read(7'h0B, 1'b0, d, ok);
+        check("CRC_ERRS +3 after bad burst writes", d - prev_cnt, 32'd3);
+        burst_read(7'h10, 16, 8'd15, 1'b0, ok);
+        check("RAM readback after bad bursts (crc)", {31'h0, ok}, 32'h1);
+        for (i = 0; i < 16; i = i + 1)
+            check("RAM unchanged by rejected bursts", br[i], bref[i]);
+
+        reg_read(7'h0B, 1'b0, prev_cnt, ok);
+        burst_read(7'h10, 4, 8'd3, 1'b1, ok);            // bad header CRC
+        check("bad-header burst read flagged", {31'h0, ok}, 32'h0);
+        check("bad-header burst read data", br[0], 32'hFFFF_FFFF);
+        burst_read(7'h10, 1, 8'h10, 1'b0, ok);           // N = 17
+        check("N=17 burst read flagged", {31'h0, ok}, 32'h0);
+        check("N=17 burst read data", br[0], 32'hFFFF_FFFF);
+        reg_read(7'h0B, 1'b0, d, ok);
+        check("CRC_ERRS +2 after bad burst reads", d - prev_cnt, 32'd2);
+
+        // Single frames still work right after a burst
+        burst_write(7'h10, 1, 8'd0, 1'b0, 1'b0, 0);
+        reg_write(7'h02, 32'h5EED_5EED, 1'b0);
+        read_expect("single write right after a burst", 7'h02, 32'h5EED_5EED);
 
         // IRQ: CRC error bit (bit 2), enabled after the fact
         reg_write(7'h08, 32'h7, 1'b0);            // clear all

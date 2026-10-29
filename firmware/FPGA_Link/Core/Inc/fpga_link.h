@@ -4,7 +4,7 @@
  * SPI settings (CubeMX, SPI1 on the Nucleo-G431KB):
  *   Mode: Full-Duplex Master, Hardware NSS: Disable (CS is a GPIO)
  *   Data size 8 bits, MSB first, CPOL Low, CPHA 1 Edge (mode 0)
- *   Prescaler 32 (5.3 MHz) to start; 16 (10.6 MHz) once the link is clean
+ *   Prescaler 16 (10.6 MHz); 32 (5.3 MHz) also supported
  *   CRC calculation: Disabled (the protocol carries its own CRC)
  *
  * Frame format and CRC are described in rtl/spi_link.v.
@@ -31,6 +31,7 @@ typedef enum {
     FPGA_ERR_VERIFY,    /* write readback did not match                 */
     FPGA_ERR_ID,        /* ID register did not read FPGA_ID_VALUE       */
     FPGA_ERR_VERSION,   /* register map version mismatch                */
+    FPGA_ERR_PARAM,     /* bad argument (burst count 0 or > 16)         */
 } fpga_status_t;
 
 typedef struct {
@@ -70,6 +71,15 @@ fpga_status_t fpga_write(fpga_link_t *link, uint8_t addr, uint32_t value);
 fpga_status_t fpga_read(fpga_link_t *link, uint8_t addr, uint32_t *value);
 fpga_status_t fpga_write_verify(fpga_link_t *link, uint8_t addr, uint32_t value);
 
+/* Burst access to count (1..FPGA_BURST_MAX) consecutive registers starting at
+ * addr, in one frame. Addresses wrap at 0x7F. A burst write is all-or-nothing:
+ * the FPGA applies it only if both CRCs match. A burst read retries as a whole
+ * on a CRC error, like fpga_read. */
+fpga_status_t fpga_write_burst(fpga_link_t *link, uint8_t addr,
+                               const uint32_t *values, uint32_t count);
+fpga_status_t fpga_read_burst(fpga_link_t *link, uint8_t addr,
+                              uint32_t *values, uint32_t count);
+
 /* Read-modify-write helper (not atomic with respect to the FPGA). */
 fpga_status_t fpga_modify(fpga_link_t *link, uint8_t addr,
                           uint32_t clear_mask, uint32_t set_mask);
@@ -77,6 +87,11 @@ fpga_status_t fpga_modify(fpga_link_t *link, uint8_t addr,
 /* Random write/readback stress on SCRATCH. Shows progress on the 7-seg. */
 fpga_status_t fpga_selftest(fpga_link_t *link, uint32_t iterations,
                             fpga_selftest_t *result);
+
+/* Same idea with 16-word bursts on SCRATCH_RAM: each iteration is one burst
+ * write and one burst read; mismatches count words. */
+fpga_status_t fpga_selftest_burst(fpga_link_t *link, uint32_t iterations,
+                                  fpga_selftest_t *result);
 
 /* CRC-8, poly 0x07, init 0x00 (exposed for host tests). */
 uint8_t fpga_crc8(uint8_t crc, const uint8_t *data, uint32_t len);

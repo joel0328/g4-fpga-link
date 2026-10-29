@@ -14,7 +14,8 @@
  *
  * What it does:
  *   1. Init: reset the FPGA, check ID and map version.
- *   2. Self-test: 10,000 random write/readback pairs on SCRATCH.
+ *   2. Self-test: 10,000 random write/readback pairs on SCRATCH, then
+ *      2,000 16-word burst write/readback pairs on SCRATCH_RAM.
  *   3. Run loop: LEDs mirror the switches; FPGA LOOP_TICK runs at 1 kHz and
  *      its count is shown on the 7-segment display; once a second the app
  *      prints tick count, tick jitter and link statistics.
@@ -25,6 +26,8 @@
 #include "fpga_link_app.h"
 
 extern SPI_HandleTypeDef hspi1;
+
+#define BURST_TEST_ITERATIONS 2000u   /* 2 x 2000 frames, 32,000 words each way */
 
 static fpga_link_t fpga = {
     .hspi       = &hspi1,
@@ -90,6 +93,20 @@ static void run_selftest(void)
            (unsigned long)r.fpga_crc_errors, (unsigned long)r.spi_errors);
     if (r.elapsed_ms)
         printf("  %lu register transactions/s\r\n",
+               (unsigned long)(2000u * r.iterations / r.elapsed_ms));
+
+    printf("Burst self-test: %lu x 16-word write/readback bursts...\r\n",
+           (unsigned long)BURST_TEST_ITERATIONS);
+    st = fpga_selftest_burst(&fpga, BURST_TEST_ITERATIONS, &r);
+    printf("  %s: %lu iterations in %lu ms, mismatches %lu, MCU CRC errors %lu, "
+           "FPGA CRC errors %lu, SPI errors %lu\r\n",
+           fpga_status_str(st),
+           (unsigned long)r.iterations, (unsigned long)r.elapsed_ms,
+           (unsigned long)r.mismatches, (unsigned long)r.crc_errors,
+           (unsigned long)r.fpga_crc_errors, (unsigned long)r.spi_errors);
+    if (r.elapsed_ms)
+        printf("  %lu register words/s (%lu burst frames/s)\r\n",
+               (unsigned long)(2000u * FPGA_BURST_MAX * r.iterations / r.elapsed_ms),
                (unsigned long)(2000u * r.iterations / r.elapsed_ms));
 }
 

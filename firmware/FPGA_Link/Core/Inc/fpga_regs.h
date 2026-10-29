@@ -1,6 +1,6 @@
 /*
  * fpga_regs.h - register map for the Basys 3 link bitstream.
- * Keep in sync with rtl/regfile.v (map version 1).
+ * Keep in sync with rtl/regfile.v (map version 2).
  */
 #ifndef FPGA_REGS_H
 #define FPGA_REGS_H
@@ -19,10 +19,16 @@
 #define FPGA_REG_CRC_ERRS    0x0Bu  /* RO   frames rejected for bad CRC     */
 #define FPGA_REG_TIME_US     0x0Cu  /* RO   free-running microseconds       */
 #define FPGA_REG_CTRL        0x0Du  /* W    [0] clear link/tick counters    */
+#define FPGA_REG_SCRATCH_RAM 0x10u  /* RW   16 words, 0x10-0x1F, for burst tests */
+#define FPGA_SCRATCH_RAM_WORDS 16u
 
 #define FPGA_ID_VALUE        0x47344650u
-#define FPGA_MAP_VERSION     1u
+#define FPGA_MAP_VERSION     2u
 #define FPGA_UNMAPPED_VALUE  0xDEADBEEFu
+
+/* Burst frames: header address 0x7F is the escape, never a register */
+#define FPGA_BURST_ADDR      0x7Fu
+#define FPGA_BURST_MAX       16u
 
 /* IRQ_STATUS / IRQ_ENABLE bits */
 #define FPGA_IRQ_TICK        (1u << 0)

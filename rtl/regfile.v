@@ -1,10 +1,10 @@
 // regfile.v
-// Register map for the MCU <-> FPGA link (first bring-up build).
+// Register map for the MCU <-> FPGA link (map version 2: burst frames).
 // Addresses are 7-bit; data is 32-bit. Keep fpga_regs.h in sync with this file.
 //
 // Addr  Name        Access  Description
 // 0x00  ID          RO      0x4734_4650 ("G4FP") - link sanity check
-// 0x01  VERSION     RO      Register map version (0x0000_0001)
+// 0x01  VERSION     RO      Register map version (0x0000_0002)
 // 0x02  SCRATCH     RW      Free read/write register for link tests
 // 0x03  LEDS        RW      [15:0] Basys 3 LEDs
 // 0x04  SWITCHES    RO      [15:0] slide switches, [20:16] buttons U,L,R,D,C (debounced)
@@ -19,6 +19,8 @@
 // 0x0B  CRC_ERRS    RO      Frames rejected for bad CRC
 // 0x0C  TIME_US     RO      Free-running microsecond timestamp
 // 0x0D  CTRL        W       [0] write 1 to clear FRAMES_OK, CRC_ERRS, TICK_COUNT
+// 0x10-0x1F SCRATCH_RAM RW  16 free words for burst tests
+// 0x7F  (reserved)          burst escape in the frame header; never a register
 //
 // Unmapped addresses read 0xDEAD_BEEF.
 
@@ -46,7 +48,7 @@ module regfile (
 );
 
     localparam [31:0] ID_VALUE = 32'h4734_4650;
-    localparam [31:0] VERSION  = 32'h0000_0001;
+    localparam [31:0] VERSION  = 32'h0000_0002;
 
     reg [31:0] scratch    = 32'h0;
     reg [20:0] seg7_reg   = 21'h0;
@@ -60,8 +62,13 @@ module regfile (
     reg [31:0] time_us    = 32'h0;
     reg [6:0]  us_div     = 7'd0;
     reg [20:0] inputs_q   = 21'h0;
+    reg [31:0] sram [0:15];          // SCRATCH_RAM, 0x10-0x1F (not reset)
 
     wire [20:0] inputs_now = {buttons, switches};
+    wire        sram_sel   = (addr[6:4] == 3'b001);
+
+    integer k;
+    initial for (k = 0; k < 16; k = k + 1) sram[k] = 32'h0;   // configuration value
     wire tick_on = (tick_div >= 32'd100);
 
     assign seg7_value  = seg7_reg[20] ? seg7_reg[15:0] : frames_ok[15:0];
@@ -69,7 +76,8 @@ module regfile (
     assign irq = |(irq_status & irq_enable);
 
     always @(*) begin
-        case (addr)
+        if (sram_sel) rdata = sram[addr[3:0]];
+        else case (addr)
             7'h00: rdata = ID_VALUE;
             7'h01: rdata = VERSION;
             7'h02: rdata = scratch;
@@ -143,6 +151,9 @@ module regfile (
             // Register writes (applied after the event updates above, so a
             // write-1-to-clear in the same cycle as a new event clears it;
             // the event will simply reassert on its next occurrence)
+            if (we && sram_sel)
+                sram[addr[3:0]] <= wdata;
+
             if (we) begin
                 case (addr)
                     7'h02: scratch  <= wdata;
