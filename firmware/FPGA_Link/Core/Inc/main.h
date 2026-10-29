@@ -8,6 +8,7 @@
   */
 /* USER CODE END Header */
 
+/* Define to prevent recursive inclusion -------------------------------------*/
 #ifndef __MAIN_H
 #define __MAIN_H
 
@@ -18,9 +19,25 @@ extern "C" {
 /* Includes ------------------------------------------------------------------*/
 #include "stm32g4xx_hal.h"
 
+/* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
 /* USER CODE END Includes */
+
+/* Exported types ------------------------------------------------------------*/
+/* USER CODE BEGIN ET */
+
+/* USER CODE END ET */
+
+/* Exported constants --------------------------------------------------------*/
+/* USER CODE BEGIN EC */
+
+/* USER CODE END EC */
+
+/* Exported macro ------------------------------------------------------------*/
+/* USER CODE BEGIN EM */
+
+/* USER CODE END EM */
 
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
@@ -30,13 +47,13 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define FPGA_TICK_Pin GPIO_PIN_0
-#define FPGA_TICK_GPIO_Port GPIOB
-#define FPGA_TICK_EXTI_IRQn EXTI0_IRQn
 #define USART2_TX_Pin GPIO_PIN_2
 #define USART2_TX_GPIO_Port GPIOA
 #define USART2_RX_Pin GPIO_PIN_3
 #define USART2_RX_GPIO_Port GPIOA
+#define FPGA_TICK_Pin GPIO_PIN_0
+#define FPGA_TICK_GPIO_Port GPIOB
+#define FPGA_TICK_EXTI_IRQn EXTI0_IRQn
 #define FPGA_FAULT_N_Pin GPIO_PIN_8
 #define FPGA_FAULT_N_GPIO_Port GPIOA
 #define FPGA_CS_Pin GPIO_PIN_11
