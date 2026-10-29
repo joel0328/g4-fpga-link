@@ -10,16 +10,18 @@
  *   FPGA_IRQ     PA12 (D2)   GPIO_EXTI12, rising edge, pull-down
  *   FPGA_TICK    PB0  (D3)   GPIO_EXTI0,  rising edge, pull-down
  *   FPGA_FAULT_N PA8  (D9)   GPIO_Input,  pull-up
- *   SPI1: PB3 SCK (D13), PB4 MISO (D12), PB5 MOSI (D11)
+ *   SPI1: PB3 SCK (D13), PB4 MISO (D12), PB5 MOSI (D11), with RX/TX DMA
  *
  * What it does:
  *   1. Init: reset the FPGA, check ID and map version.
  *   2. Self-test: 10,000 random write/readback pairs on SCRATCH, then
  *      2,000 16-word burst write/readback pairs on SCRATCH_RAM.
- *   3. Run loop: LEDs mirror the switches; FPGA LOOP_TICK runs at 1 kHz and
- *      its count is shown on the 7-segment display; once a second the app
- *      prints tick count, tick jitter and link statistics.
- *      Press btnC on the Basys to re-run the self-test.
+ *   3. Run: on every 1 kHz LOOP_TICK a control step runs entirely in
+ *      interrupts over SPI DMA (see "Control step" below): LEDs follow the
+ *      switches, the 7-segment display shows the tick count, pending FPGA
+ *      IRQs are cleared. The main loop does no SPI; once a second it prints
+ *      tick, link and control-step statistics.
+ *      Press btnC on the Basys to re-run the self-tests.
  */
 #include <stdio.h>
 #include "fpga_link.h"
@@ -50,6 +52,143 @@ bool fpga_app_link_up(void)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Control step: one per LOOP_TICK, all in interrupts over SPI DMA          */
+/*   tick ISR     -> burst read 0x04..0x0C (inputs, status, counters, time) */
+/*   read done    -> burst write 0x03..0x05 (LEDS, SWITCHES = RO, SEG7)      */
+/*   write done   -> if an enabled IRQ is pending, W1C it (1-word burst)    */
+/* ------------------------------------------------------------------------ */
+enum { IN_SWITCHES, IN_SEG7, IN_TICK_DIV, IN_TICK_COUNT, IN_IRQ_STATUS,
+       IN_IRQ_ENABLE, IN_FRAMES_OK, IN_CRC_ERRS, IN_TIME_US, IN_N };
+#define STEP_READ_ADDR   FPGA_REG_SWITCHES
+#define STEP_WRITE_ADDR  FPGA_REG_LEDS
+#define STEP_WRITE_N     3u   /* LEDS, SWITCHES (read-only: ignored), SEG7 */
+
+typedef struct {
+    uint32_t done, skipped, errors;
+    uint32_t lat_min, lat_max;    /* tick edge -> last frame done, cycles */
+    uint64_t lat_sum;
+    uint64_t cpu_sum;             /* cycles spent in our tick/DMA callbacks */
+    uint32_t in[IN_N];            /* last good read */
+} step_stats_t;
+
+static uint32_t step_in[IN_N];
+static uint32_t step_out[STEP_WRITE_N];
+static uint32_t step_irq_clear;
+static volatile bool step_enabled;   /* off during init and self-tests */
+static volatile bool step_active;    /* this step's frames are in flight */
+static uint32_t step_t0, step_cpu;
+static step_stats_t step_stats;      /* written in ISRs; read via step_snapshot() */
+
+static void step_stats_reset(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    step_stats = (step_stats_t){ .lat_min = 0xFFFFFFFFu };
+    __set_PRIMASK(primask);
+}
+
+static void step_snapshot(step_stats_t *s)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    *s = step_stats;
+    __set_PRIMASK(primask);
+}
+
+static void step_end(bool ok)
+{
+    if (ok) {
+        uint32_t lat = DWT->CYCCNT - step_t0;
+        step_stats.done++;
+        if (lat < step_stats.lat_min) step_stats.lat_min = lat;
+        if (lat > step_stats.lat_max) step_stats.lat_max = lat;
+        step_stats.lat_sum += lat;
+        step_stats.cpu_sum += step_cpu;
+    } else {
+        step_stats.errors++;
+    }
+    step_active = false;
+}
+
+static void step_written(fpga_link_t *l, fpga_status_t st)
+{
+    uint32_t c0 = DWT->CYCCNT;
+    bool ok = (st == FPGA_OK), more = false;
+
+    if (ok && step_irq_clear) {
+        uint32_t v = step_irq_clear;   /* copied by the driver */
+        step_irq_clear = 0;
+        ok = more = (fpga_write_burst_async(l, FPGA_REG_IRQ_STATUS, &v, 1,
+                                            step_written) == FPGA_OK);
+    }
+    step_cpu += DWT->CYCCNT - c0;
+    if (!more)
+        step_end(ok);
+}
+
+static void step_read_done(fpga_link_t *l, fpga_status_t st)
+{
+    uint32_t c0 = DWT->CYCCNT;
+    bool ok = (st == FPGA_OK);
+
+    if (ok) {
+        /* The "control law": LEDs follow the switches, display shows ticks */
+        step_out[0] = step_in[IN_SWITCHES] & FPGA_SW_MASK;
+        step_out[1] = 0;
+        step_out[2] = FPGA_SEG7_USE_REG | FPGA_SEG7_ALL_DIGITS |
+                      (tick_isr_count & 0xFFFFu);
+        step_irq_clear = step_in[IN_IRQ_STATUS] & step_in[IN_IRQ_ENABLE];
+        for (uint32_t i = 0; i < IN_N; i++)
+            step_stats.in[i] = step_in[i];
+        ok = (fpga_write_burst_async(l, STEP_WRITE_ADDR, step_out, STEP_WRITE_N,
+                                     step_written) == FPGA_OK);
+    }
+    step_cpu += DWT->CYCCNT - c0;
+    if (!ok)
+        step_end(false);
+}
+
+static void step_start(uint32_t now)
+{
+    if (!step_enabled)
+        return;
+    if (step_active) {            /* previous step still running */
+        step_stats.skipped++;
+        return;
+    }
+    step_active = true;
+    step_t0 = now;
+    step_cpu = 0;
+    if (fpga_read_burst_async(&fpga, STEP_READ_ADDR, step_in, IN_N,
+                              step_read_done) != FPGA_OK) {
+        step_active = false;      /* link busy (main-loop transfer) or SPI error */
+        step_stats.skipped++;
+        return;
+    }
+    step_cpu += DWT->CYCCNT - now;
+}
+
+/* Stop starting steps and wait for the one in flight (main loop only) */
+static void steps_pause(void)
+{
+    step_enabled = false;
+    while (step_active)
+        ;
+}
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi == fpga.hspi)
+        fpga_async_complete(&fpga, true);
+}
+
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi == fpga.hspi)
+        fpga_async_complete(&fpga, false);
+}
+
+/* ------------------------------------------------------------------------ */
 /* EXTI: LOOP_TICK and FPGA_IRQ                                             */
 /* ------------------------------------------------------------------------ */
 void HAL_GPIO_EXTI_Callback(uint16_t pin)
@@ -64,7 +203,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t pin)
         }
         tick_last_cyc = now;
         tick_isr_count++;
-        /* A control loop would run here: read sensors, step(), write outputs */
+        step_start(now);
     } else if (pin == FPGA_IRQ_Pin) {
         irq_isr_count++;
     }
@@ -114,6 +253,7 @@ void fpga_app_init(void)
 {
     fpga_status_t st;
 
+    step_enabled = false;
     dwt_enable();
     printf("\r\n=== FPGA link bring-up ===\r\n");
     printf("SPI1 clock: %lu Hz\r\n",
@@ -133,18 +273,29 @@ void fpga_app_init(void)
 
     run_selftest();
 
-    /* 1 kHz loop tick, tick IRQ off (tick has its own line) */
     fpga_write(&fpga, FPGA_REG_IRQ_STATUS, 0x7);
     fpga_write(&fpga, FPGA_REG_IRQ_ENABLE, FPGA_IRQ_INPUTS | FPGA_IRQ_CRC_ERR);
+
+    /* Forget ticks that arrived from the previous run before fpga_init reset
+     * the FPGA: they made the period max and the MCU/FPGA counts disagree.
+     * The self-test cleared the FPGA's TICK_COUNT. */
+    __disable_irq();
+    tick_isr_count = 0;
+    tick_min_cyc = 0xFFFFFFFFu;
+    tick_max_cyc = 0;
+    __enable_irq();
+    step_stats_reset();
+
+    /* 1 kHz loop tick, tick IRQ off (tick has its own line) */
     fpga_write(&fpga, FPGA_REG_TICK_DIV, FPGA_TICK_DIV_FOR_HZ(1000));
+    step_enabled = true;
 }
 
 void fpga_app_poll(void)
 {
     static uint32_t last_print;
     static uint32_t last_btn;
-    static uint32_t last_irq;
-    uint32_t sw, v;
+    step_stats_t s;
 
     if (!link_up) {
         /* Retry init every 2 s so the bitstream can be loaded after the MCU */
@@ -155,45 +306,38 @@ void fpga_app_poll(void)
         return;
     }
 
-    /* LEDs mirror switches */
-    if (fpga_read(&fpga, FPGA_REG_SWITCHES, &sw) == FPGA_OK) {
-        fpga_write(&fpga, FPGA_REG_LEDS, sw & FPGA_SW_MASK);
+    step_snapshot(&s);
 
-        uint32_t btn_c = sw & FPGA_BTN_C;
-        if (btn_c && !last_btn)
-            run_selftest();
-        last_btn = btn_c;
+    /* btnC: pause the control step and re-run the self-tests */
+    uint32_t btn_c = s.in[IN_SWITCHES] & FPGA_BTN_C;
+    if (btn_c && !last_btn) {
+        steps_pause();
+        run_selftest();
+        step_enabled = true;
     }
-
-    /* Tick count on the display */
-    fpga_write(&fpga, FPGA_REG_SEG7,
-               FPGA_SEG7_USE_REG | FPGA_SEG7_ALL_DIGITS | (tick_isr_count & 0xFFFFu));
-
-    /* FPGA_IRQ is a level (status & enable) and the EXTI fires on its rising
-     * edge, so clear the status to re-arm it. Checking the pin level (not just
-     * the ISR count) also catches an event that lands while we are clearing. */
-    if (irq_isr_count != last_irq ||
-        HAL_GPIO_ReadPin(FPGA_IRQ_GPIO_Port, FPGA_IRQ_Pin) == GPIO_PIN_SET) {
-        last_irq = irq_isr_count;
-        if (fpga_read(&fpga, FPGA_REG_IRQ_STATUS, &v) == FPGA_OK)
-            fpga_write(&fpga, FPGA_REG_IRQ_STATUS, v);
-    }
+    last_btn = btn_c;
 
     if (HAL_GetTick() - last_print >= 1000u) {
-        uint32_t fpga_ticks = 0, frames = 0, crc_errs = 0;
         last_print = HAL_GetTick();
-        fpga_read(&fpga, FPGA_REG_TICK_COUNT, &fpga_ticks);
-        fpga_read(&fpga, FPGA_REG_FRAMES_OK, &frames);
-        fpga_read(&fpga, FPGA_REG_CRC_ERRS, &crc_errs);
+        uint32_t cyc_per_us = SystemCoreClock / 1000000u;
 
         /* Tick period min/max in ns: shows LOOP_TICK + EXTI latency jitter */
-        uint32_t cyc_per_us = SystemCoreClock / 1000000u;
         printf("ticks MCU %lu / FPGA %lu, period %lu..%lu ns, frames %lu, "
                "FPGA CRC errs %lu, MCU CRC errs %lu, IRQs %lu\r\n",
-               (unsigned long)tick_isr_count, (unsigned long)fpga_ticks,
+               (unsigned long)tick_isr_count, (unsigned long)s.in[IN_TICK_COUNT],
                (unsigned long)(tick_min_cyc * 1000u / cyc_per_us),
                (unsigned long)(tick_max_cyc * 1000u / cyc_per_us),
-               (unsigned long)frames, (unsigned long)crc_errs,
+               (unsigned long)s.in[IN_FRAMES_OK], (unsigned long)s.in[IN_CRC_ERRS],
                (unsigned long)fpga.crc_errors, (unsigned long)irq_isr_count);
+
+        if (s.done)
+            printf("step: done %lu, skipped %lu, errors %lu, latency %lu..%lu ns "
+                   "(avg %lu), callback CPU avg %lu ns\r\n",
+                   (unsigned long)s.done, (unsigned long)s.skipped,
+                   (unsigned long)s.errors,
+                   (unsigned long)(s.lat_min * 1000u / cyc_per_us),
+                   (unsigned long)(s.lat_max * 1000u / cyc_per_us),
+                   (unsigned long)(s.lat_sum * 1000u / cyc_per_us / s.done),
+                   (unsigned long)(s.cpu_sum * 1000u / cyc_per_us / s.done));
     }
 }

@@ -13,8 +13,16 @@ typedef struct { int dummy; } GPIO_TypeDef;
 HAL_StatusTypeDef HAL_SPI_TransmitReceive(SPI_HandleTypeDef *h, uint8_t *tx,
                                           uint8_t *rx, uint16_t len,
                                           uint32_t timeout);
+HAL_StatusTypeDef HAL_SPI_TransmitReceive_DMA(SPI_HandleTypeDef *h, uint8_t *tx,
+                                              uint8_t *rx, uint16_t len);
+HAL_StatusTypeDef HAL_SPI_Abort(SPI_HandleTypeDef *h);
 void     HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, GPIO_PinState s);
 void     HAL_Delay(uint32_t ms);
 uint32_t HAL_GetTick(void);
+
+/* CMSIS interrupt masking: nothing to mask on a PC */
+static inline uint32_t __get_PRIMASK(void) { return 0; }
+static inline void     __set_PRIMASK(uint32_t m) { (void)m; }
+static inline void     __disable_irq(void) { }
 
 #endif

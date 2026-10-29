@@ -37,6 +37,8 @@ TICK_RE = re.compile(r"ticks MCU (\d+) / FPGA (\d+), period (\d+)\.\.(\d+) ns, f
                      r"FPGA CRC errs (\d+), MCU CRC errs (\d+), IRQs (\d+)")
 SELFTEST_RE = re.compile(r"^\s*(\S.*?): (\d+) iterations in (\d+) ms, mismatches (\d+), "
                          r"MCU CRC errors (\d+), FPGA CRC errors (\d+), SPI errors (\d+)")
+STEP_RE = re.compile(r"step: done (\d+), skipped (\d+), errors (\d+), latency (\d+)\.\.(\d+) ns "
+                     r"\(avg (\d+)\), callback CPU avg (\d+) ns")
 
 
 def find_port():
@@ -88,6 +90,8 @@ def judge(lines):
     selftests = parse_selftests(lines)
     ticks = [TICK_RE.search(l) for l in lines]
     ticks = [m for m in ticks if m]
+    steps = [STEP_RE.search(l) for l in lines]
+    steps = [m for m in steps if m]
 
     checks = []
     checks.append(("FPGA answered (ID + map version)", init_ok,
@@ -117,6 +121,18 @@ def judge(lines):
     else:
         checks.append(("LOOP_TICK ~1 kHz, MCU and FPGA agree", False,
                        f"only {len(ticks)} status line(s) seen; run longer"))
+
+    if len(steps) >= 2:
+        a, b = steps[0], steps[-1]
+        rate = (int(b.group(1)) - int(a.group(1))) / (len(steps) - 1)
+        clean = int(b.group(2)) == 0 and int(b.group(3)) == 0 and 900 <= rate <= 1100
+        checks.append(("Control step on every tick (SPI DMA)", clean,
+                       f"{rate:.0f}/s, skipped {b.group(2)}, errors {b.group(3)}, "
+                       f"latency {b.group(4)}..{b.group(5)} ns (avg {b.group(6)}), "
+                       f"callback CPU avg {b.group(7)} ns"))
+    else:
+        checks.append(("Control step on every tick (SPI DMA)", False,
+                       f"only {len(steps)} step line(s) seen"))
 
     print("\n--- Bring-up checks ---")
     for name, ok, detail in checks:

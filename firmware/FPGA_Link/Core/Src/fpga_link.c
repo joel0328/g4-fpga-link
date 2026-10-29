@@ -45,15 +45,34 @@ static inline void cs_high(fpga_link_t *l)
     HAL_GPIO_WritePin(l->cs_port, l->cs_pin, GPIO_PIN_SET);
 }
 
+/* Take the link if it is free. Interrupt-safe: an async start in an ISR and a
+ * blocking call in the main loop can't both get it. */
+static bool link_acquire(fpga_link_t *l)
+{
+    uint32_t primask = __get_PRIMASK();
+    bool ok;
+
+    __disable_irq();
+    ok = !l->busy;
+    if (ok)
+        l->busy = true;
+    __set_PRIMASK(primask);
+    return ok;
+}
+
 static fpga_status_t xfer(fpga_link_t *l, const uint8_t *tx, uint8_t *rx,
                           uint16_t len)
 {
     uint32_t to = l->timeout_ms ? l->timeout_ms : FPGA_DEFAULT_TIMEOUT_MS;
     HAL_StatusTypeDef hs;
 
+    while (!link_acquire(l))
+        ;   /* an async frame is in flight; its DMA interrupt frees the link */
+
     cs_low(l);
     hs = HAL_SPI_TransmitReceive(l->hspi, (uint8_t *)tx, rx, len, to);
     cs_high(l);
+    l->busy = false;
 
     if (hs != HAL_OK) {
         l->spi_errors++;
@@ -129,61 +148,139 @@ fpga_status_t fpga_read(fpga_link_t *l, uint8_t addr, uint32_t *value)
 /*   [0x7F | 0x80 for read] [start addr] [N-1] [CRC(0..2)] data... [CRC]    */
 /* ------------------------------------------------------------------------ */
 #define BURST_HDR_LEN   4u
-#define BURST_FRAME_MAX (BURST_HDR_LEN + 4u * FPGA_BURST_MAX + 1u)
 
-static void burst_header(uint8_t *tx, uint8_t hdr, uint8_t addr, uint32_t count)
+/* Build a burst frame in tx; returns its length. values is NULL for a read
+ * (the data bytes are then zeros, clocking out the FPGA's reply). */
+static uint16_t build_burst(uint8_t *tx, uint8_t addr, const uint32_t *values,
+                            uint32_t count)
 {
-    tx[0] = hdr;
+    uint32_t data_len = 4u * count;
+
+    tx[0] = values ? FPGA_BURST_ADDR : (0x80u | FPGA_BURST_ADDR);
     tx[1] = addr & 0x7Fu;
     tx[2] = (uint8_t)(count - 1u);
     tx[3] = fpga_crc8(0, tx, 3);
+    for (uint32_t i = 0; i < count; i++)
+        put_be32(&tx[BURST_HDR_LEN + 4u * i], values ? values[i] : 0u);
+    tx[BURST_HDR_LEN + data_len] = values ? fpga_crc8(0, &tx[BURST_HDR_LEN], data_len) : 0;
+    return (uint16_t)(BURST_HDR_LEN + data_len + 1u);
+}
+
+/* Check a burst read reply and unpack it */
+static bool parse_burst(const uint8_t *rx, uint32_t *values, uint32_t count)
+{
+    uint32_t data_len = 4u * count;
+
+    if (fpga_crc8(0, &rx[BURST_HDR_LEN], data_len) != rx[BURST_HDR_LEN + data_len])
+        return false;
+    for (uint32_t i = 0; i < count; i++)
+        values[i] = get_be32(&rx[BURST_HDR_LEN + 4u * i]);
+    return true;
 }
 
 fpga_status_t fpga_write_burst(fpga_link_t *l, uint8_t addr,
                                const uint32_t *values, uint32_t count)
 {
-    uint8_t tx[BURST_FRAME_MAX], rx[BURST_FRAME_MAX];
-    uint32_t data_len = 4u * count;
+    uint8_t tx[FPGA_FRAME_MAX], rx[FPGA_FRAME_MAX];
+    uint16_t len;
 
     if (count == 0u || count > FPGA_BURST_MAX)
         return FPGA_ERR_PARAM;
 
-    burst_header(tx, FPGA_BURST_ADDR, addr, count);
-    for (uint32_t i = 0; i < count; i++)
-        put_be32(&tx[BURST_HDR_LEN + 4u * i], values[i]);
-    tx[BURST_HDR_LEN + data_len] = fpga_crc8(0, &tx[BURST_HDR_LEN], data_len);
-
+    len = build_burst(tx, addr, values, count);
     l->writes++;
-    return xfer(l, tx, rx, (uint16_t)(BURST_HDR_LEN + data_len + 1u));
+    return xfer(l, tx, rx, len);
 }
 
 fpga_status_t fpga_read_burst(fpga_link_t *l, uint8_t addr,
                               uint32_t *values, uint32_t count)
 {
-    uint8_t tx[BURST_FRAME_MAX] = {0}, rx[BURST_FRAME_MAX];
-    uint32_t data_len = 4u * count;
+    uint8_t tx[FPGA_FRAME_MAX], rx[FPGA_FRAME_MAX];
     fpga_status_t st = FPGA_ERR_CRC;
+    uint16_t len;
 
     if (count == 0u || count > FPGA_BURST_MAX)
         return FPGA_ERR_PARAM;
 
-    burst_header(tx, 0x80u | FPGA_BURST_ADDR, addr, count);
+    len = build_burst(tx, addr, NULL, count);
 
     for (uint32_t attempt = 0; attempt <= l->retries; attempt++) {
         l->reads++;
-        st = xfer(l, tx, rx, (uint16_t)(BURST_HDR_LEN + data_len + 1u));
+        st = xfer(l, tx, rx, len);
         if (st != FPGA_OK)
             continue;
-
-        if (fpga_crc8(0, &rx[BURST_HDR_LEN], data_len) == rx[BURST_HDR_LEN + data_len]) {
-            for (uint32_t i = 0; i < count; i++)
-                values[i] = get_be32(&rx[BURST_HDR_LEN + 4u * i]);
+        if (parse_burst(rx, values, count))
             return FPGA_OK;
-        }
         l->crc_errors++;
         st = FPGA_ERR_CRC;
     }
     return st;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Async bursts (SPI DMA)                                                   */
+/* ------------------------------------------------------------------------ */
+static fpga_status_t start_async(fpga_link_t *l, uint8_t addr,
+                                 const uint32_t *wvalues, uint32_t *rvalues,
+                                 uint32_t count, fpga_async_cb_t done)
+{
+    uint16_t len;
+
+    if (count == 0u || count > FPGA_BURST_MAX)
+        return FPGA_ERR_PARAM;
+    if (!link_acquire(l))
+        return FPGA_ERR_BUSY;
+
+    len = build_burst(l->dma_tx, addr, wvalues, count);
+    l->dma_dest  = rvalues;
+    l->dma_count = count;
+    l->dma_cb    = done;
+    if (rvalues) l->reads++; else l->writes++;
+
+    cs_low(l);
+    if (HAL_SPI_TransmitReceive_DMA(l->hspi, l->dma_tx, l->dma_rx, len) != HAL_OK) {
+        /* If the TX DMA failed to start, HAL returns an error but stays
+         * BUSY_TX_RX with the RX DMA armed, refusing every later transfer.
+         * Abort to put SPI and both DMA channels back to ready. */
+        HAL_SPI_Abort(l->hspi);
+        cs_high(l);
+        l->busy = false;
+        l->spi_errors++;
+        return FPGA_ERR_SPI;
+    }
+    return FPGA_OK;
+}
+
+fpga_status_t fpga_read_burst_async(fpga_link_t *l, uint8_t addr,
+                                    uint32_t *values, uint32_t count,
+                                    fpga_async_cb_t done)
+{
+    return start_async(l, addr, NULL, values, count, done);
+}
+
+fpga_status_t fpga_write_burst_async(fpga_link_t *l, uint8_t addr,
+                                     const uint32_t *values, uint32_t count,
+                                     fpga_async_cb_t done)
+{
+    return start_async(l, addr, values, NULL, count, done);
+}
+
+void fpga_async_complete(fpga_link_t *l, bool spi_ok)
+{
+    fpga_status_t st = FPGA_OK;
+    fpga_async_cb_t cb = l->dma_cb;
+
+    cs_high(l);
+    if (!spi_ok) {
+        l->spi_errors++;
+        st = FPGA_ERR_SPI;
+    } else if (l->dma_dest && !parse_burst(l->dma_rx, l->dma_dest, l->dma_count)) {
+        l->crc_errors++;
+        st = FPGA_ERR_CRC;
+    }
+    l->busy = false;   /* before the callback, so it can chain the next frame */
+    if (cb)
+        cb(l, st);
 }
 
 fpga_status_t fpga_write_verify(fpga_link_t *l, uint8_t addr, uint32_t value)
@@ -363,6 +460,7 @@ const char *fpga_status_str(fpga_status_t s)
     case FPGA_ERR_ID:      return "bad ID (no bitstream, or wiring)";
     case FPGA_ERR_VERSION: return "register map version mismatch";
     case FPGA_ERR_PARAM:   return "bad argument";
+    case FPGA_ERR_BUSY:    return "link busy";
     default:               return "unknown";
     }
 }

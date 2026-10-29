@@ -32,9 +32,19 @@ typedef enum {
     FPGA_ERR_ID,        /* ID register did not read FPGA_ID_VALUE       */
     FPGA_ERR_VERSION,   /* register map version mismatch                */
     FPGA_ERR_PARAM,     /* bad argument (burst count 0 or > 16)         */
+    FPGA_ERR_BUSY,      /* async start while a frame is still in flight */
 } fpga_status_t;
 
-typedef struct {
+/* Longest frame: burst of FPGA_BURST_MAX words */
+#define FPGA_FRAME_MAX (4u + 4u * FPGA_BURST_MAX + 1u)
+
+typedef struct fpga_link fpga_link_t;
+
+/* Completion of an async burst, called from the SPI DMA interrupt. The link
+ * is already free, so the callback may start the next async transfer. */
+typedef void (*fpga_async_cb_t)(fpga_link_t *link, fpga_status_t status);
+
+struct fpga_link {
     SPI_HandleTypeDef *hspi;
     GPIO_TypeDef      *cs_port;
     uint16_t           cs_pin;
@@ -48,7 +58,15 @@ typedef struct {
     uint32_t writes;
     uint32_t crc_errors;
     uint32_t spi_errors;
-} fpga_link_t;
+
+    /* driver-private: link ownership and the async frame in flight */
+    volatile bool   busy;
+    uint8_t         dma_tx[FPGA_FRAME_MAX];
+    uint8_t         dma_rx[FPGA_FRAME_MAX];
+    uint32_t       *dma_dest;    /* burst read destination, NULL for writes */
+    uint32_t        dma_count;
+    fpga_async_cb_t dma_cb;
+};
 
 typedef struct {
     uint32_t iterations;
@@ -79,6 +97,26 @@ fpga_status_t fpga_write_burst(fpga_link_t *link, uint8_t addr,
                                const uint32_t *values, uint32_t count);
 fpga_status_t fpga_read_burst(fpga_link_t *link, uint8_t addr,
                               uint32_t *values, uint32_t count);
+
+/* Async bursts over SPI DMA. Return at once: FPGA_OK means the frame is on its
+ * way and done() will be called (from the DMA interrupt) with the result;
+ * anything else means nothing was started and done() will not be called.
+ * Write data is copied, so values may be reused immediately; a read fills
+ * values before done() runs, so they must stay valid until then.
+ * No retries: a control loop should drop or repeat the step itself.
+ *
+ * The blocking calls above wait for an async frame in flight, so they must
+ * not be called from an interrupt while one may be running. */
+fpga_status_t fpga_read_burst_async(fpga_link_t *link, uint8_t addr,
+                                    uint32_t *values, uint32_t count,
+                                    fpga_async_cb_t done);
+fpga_status_t fpga_write_burst_async(fpga_link_t *link, uint8_t addr,
+                                     const uint32_t *values, uint32_t count,
+                                     fpga_async_cb_t done);
+
+/* Call from HAL_SPI_TxRxCpltCallback (spi_ok = true) and HAL_SPI_ErrorCallback
+ * (spi_ok = false) for this link's SPI handle. */
+void fpga_async_complete(fpga_link_t *link, bool spi_ok);
 
 /* Read-modify-write helper (not atomic with respect to the FPGA). */
 fpga_status_t fpga_modify(fpga_link_t *link, uint8_t addr,

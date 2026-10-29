@@ -40,6 +40,28 @@ HAL_StatusTypeDef HAL_SPI_TransmitReceive(SPI_HandleTypeDef *h, uint8_t *tx,
     return HAL_OK;
 }
 
+/* DMA variant: same bytes; the script then calls fpga_async_complete()
+ * itself, standing in for the DMA-complete interrupt. dma_fail_next makes
+ * the next start fail the way HAL does when the TX DMA channel is busy. */
+static int dma_fail_next, abort_calls;
+
+HAL_StatusTypeDef HAL_SPI_TransmitReceive_DMA(SPI_HandleTypeDef *h, uint8_t *tx,
+                                              uint8_t *rx, uint16_t len)
+{
+    if (dma_fail_next) {
+        dma_fail_next = 0;
+        return HAL_ERROR;
+    }
+    return HAL_SPI_TransmitReceive(h, tx, rx, len, 0);
+}
+
+HAL_StatusTypeDef HAL_SPI_Abort(SPI_HandleTypeDef *h)
+{
+    (void)h;
+    abort_calls++;
+    return HAL_OK;
+}
+
 void HAL_GPIO_WritePin(GPIO_TypeDef *p, uint16_t pin, GPIO_PinState s)
 {
     (void)p; (void)pin;
@@ -55,10 +77,20 @@ static int failures;
 static SPI_HandleTypeDef hspi;
 static GPIO_TypeDef cs_port;
 
+static int           async_calls;
+static fpga_status_t async_status;
+static void async_done(fpga_link_t *link, fpga_status_t st)
+{
+    (void)link;
+    async_calls++;
+    async_status = st;
+}
+
 static void script(int checking)
 {
-    fpga_link_t l = { .hspi = &hspi, .cs_port = &cs_port, .cs_pin = 1,
-                      .rst_port = NULL, .retries = 0 };
+    static fpga_link_t l;   /* static: it holds the DMA buffers */
+    l = (fpga_link_t){ .hspi = &hspi, .cs_port = &cs_port, .cs_pin = 1,
+                       .rst_port = NULL, .retries = 0 };
     uint32_t v = 0;
     fpga_status_t st;
 
@@ -117,6 +149,48 @@ static void script(int checking)
     if (checking) EXPECT(st == FPGA_ERR_PARAM, "single read of 0x7F: st=%d", st);
     st = fpga_write(&l, FPGA_BURST_ADDR, 0);
     if (checking) EXPECT(st == FPGA_ERR_PARAM, "single write of 0x7F: st=%d", st);
+
+    /* 8. Async bursts, completed by hand as the DMA interrupt would */
+    for (uint32_t i = 0; i < 4; i++)
+        wr[i] = 0xC0DE0000u + i;
+    async_calls = 0;
+    st = fpga_write_burst_async(&l, FPGA_REG_SCRATCH_RAM + 4u, wr, 4, async_done);
+    if (checking) EXPECT(st == FPGA_OK, "async write start: st=%d", st);
+    st = fpga_read_burst_async(&l, FPGA_REG_SCRATCH_RAM, rd, 1, async_done);
+    if (checking) EXPECT(st == FPGA_ERR_BUSY, "async start while busy: st=%d", st);
+    fpga_async_complete(&l, true);
+    if (checking) EXPECT(async_calls == 1 && async_status == FPGA_OK,
+                         "async write done: calls=%d st=%d", async_calls, async_status);
+
+    memset(rd, 0, sizeof rd);
+    st = fpga_read_burst_async(&l, FPGA_REG_SCRATCH_RAM + 3u, rd, 6, async_done);
+    if (checking) EXPECT(st == FPGA_OK, "async read start: st=%d", st);
+    fpga_async_complete(&l, true);
+    /* RAM[3] = wr[3] from step 6, RAM[4..7] = C0DE0000.., RAM[8] = step-6 value */
+    if (checking) EXPECT(async_calls == 2 && async_status == FPGA_OK &&
+                         rd[0] == ((0x01020304u * 4u) ^ 0xA5A5A5A5u) &&
+                         rd[1] == 0xC0DE0000u && rd[4] == 0xC0DE0003u &&
+                         rd[5] == ((0x01020304u * 9u) ^ 0xA5A5A5A5u),
+                         "async read: calls=%d st=%d rd=%08X %08X %08X %08X",
+                         async_calls, async_status, rd[0], rd[1], rd[4], rd[5]);
+
+    /* An SPI error reported by the interrupt reaches the callback */
+    st = fpga_read_burst_async(&l, FPGA_REG_ID, rd, 1, async_done);
+    fpga_async_complete(&l, false);
+    if (checking) EXPECT(st == FPGA_OK && async_calls == 3 && async_status == FPGA_ERR_SPI,
+                         "async SPI error: calls=%d st=%d", async_calls, async_status);
+
+    /* A failed DMA start aborts the SPI, frees the link and sends nothing */
+    abort_calls = 0;
+    dma_fail_next = 1;
+    st = fpga_write_burst_async(&l, FPGA_REG_SCRATCH_RAM, wr, 1, async_done);
+    if (checking) EXPECT(st == FPGA_ERR_SPI && abort_calls == 1 && !l.busy && async_calls == 3,
+                         "failed DMA start: st=%d aborts=%d busy=%d calls=%d",
+                         st, abort_calls, (int)l.busy, async_calls);
+
+    /* The link is free again for blocking calls */
+    st = fpga_read(&l, FPGA_REG_ID, &v);
+    if (checking) EXPECT(st == FPGA_OK && v == FPGA_ID_VALUE, "read after async: st=%d v=%08X", st, v);
 }
 
 static int load_miso(const char *path)
