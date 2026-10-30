@@ -111,7 +111,7 @@ static void script(int checking)
     /* 3. LEDs */
     fpga_write(&l, FPGA_REG_LEDS, 0x0000A5C3u);
     st = fpga_read(&l, FPGA_REG_LEDS, &v);
-    if (checking) EXPECT(st == FPGA_OK && v == 0xA5C3u, "LEDS: st=%d v=%08X", st, v);
+    if (checking) EXPECT(st == FPGA_OK && v == (0xA5C3u & FPGA_LEDS_VALUE), "LEDS: st=%d v=%08X", st, v);
 
     /* 4. Unmapped (0x7F is the burst escape, so 0x7E) */
     st = fpga_read(&l, 0x7E, &v);
@@ -140,15 +140,20 @@ static void script(int checking)
     if (checking) EXPECT(st == FPGA_OK && rd[0] == FPGA_ID_VALUE && rd[1] == FPGA_MAP_VERSION,
                          "burst ID+VERSION: st=%d %08X %08X", st, rd[0], rd[1]);
 
-    /* 6b. Safety registers: off after reset; arming reads back */
-    st = fpga_read_burst(&l, FPGA_REG_WDOG, rd, 2);
-    if (checking) EXPECT(st == FPGA_OK && rd[0] == 0u && rd[1] == 0u,
-                         "WDOG/SAFETY after reset: st=%d %08X %08X", st, rd[0], rd[1]);
-    fpga_write(&l, FPGA_REG_WDOG, 5000u);
-    fpga_write(&l, FPGA_REG_SAFETY, FPGA_SAFETY_FAULT | FPGA_SAFETY_OUT_EN);
-    st = fpga_read_burst(&l, FPGA_REG_WDOG, rd, 2);
-    if (checking) EXPECT(st == FPGA_OK && rd[0] == 5000u && rd[1] == FPGA_SAFETY_OUT_EN,
-                         "WDOG/SAFETY armed: st=%d %08X %08X", st, rd[0], rd[1]);
+    /* 6b. Safety block after reset (the replay bench has SW15 down and no
+     * tick): disarmed, WDT_TICKS default, no faults; the key can't arm */
+    st = fpga_read_burst(&l, FPGA_REG_ARM, rd, 5);
+    if (checking) EXPECT(st == FPGA_OK && rd[0] == 0u && rd[1] == FPGA_WDT_TICKS_RESET &&
+                         rd[2] == 0u && rd[3] == 0u && rd[4] == 0u,
+                         "safety block after reset: st=%d %08X %08X %08X", st, rd[0], rd[1], rd[2]);
+    fpga_write(&l, FPGA_REG_WDT_TICKS, 0u);
+    fpga_write(&l, FPGA_REG_ARM, FPGA_ARM_KEY);
+    st = fpga_read_burst(&l, FPGA_REG_ARM, rd, 2);
+    if (checking) EXPECT(st == FPGA_OK && rd[0] == 0u && rd[1] == 1u,
+                         "arm refused, WDT_TICKS 0 -> 1: st=%d %08X %08X", st, rd[0], rd[1]);
+    st = fpga_read_burst(&l, FPGA_REG_SNAP_TICK, rd, 4);
+    if (checking) EXPECT(st == FPGA_OK && rd[0] == 0u && rd[1] == 0u && rd[2] == 0u && rd[3] == 0u,
+                         "snapshot before any tick: st=%d %08X", st, rd[0]);
 
     /* 7. Bad arguments are refused without sending a frame */
     st = fpga_read_burst(&l, FPGA_REG_SCRATCH_RAM, rd, 0);

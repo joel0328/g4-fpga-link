@@ -17,25 +17,28 @@
  *   2. Self-test: 10,000 random write/readback pairs on SCRATCH, then
  *      2,000 16-word burst write/readback pairs on SCRATCH_RAM.
  *   3. Run: on every 1 kHz LOOP_TICK a control step runs entirely in
- *      interrupts over SPI DMA (see "Control step" below): LEDs follow the
- *      switches, the 7-segment display shows the tick count, pending FPGA
- *      IRQs are cleared. The main loop does no SPI; once a second it prints
- *      tick, link, control-step and safety status.
- *   4. Safety: the FPGA watchdog is armed with a 5 ms timeout (the step's
- *      frames feed it every 1 ms) and the outputs are enabled. If the MCU
- *      stops talking, the FPGA drops the outputs and latches FAULT; the app
- *      reports it and leaves it latched.
- *      Press btnC on the Basys to re-run the self-tests and re-arm (this
- *      also clears a latched FAULT).
+ *      interrupts over SPI DMA (see "Control step" below): it reads the
+ *      FPGA's tick snapshot, drives the LEDs from the switches and the
+ *      7-segment display with the tick count, kicks the FPGA watchdog and
+ *      clears pending FPGA IRQs. The main loop does no SPI while steps run;
+ *      once a second it prints tick, link, control-step and safety status.
+ *   4. Safety (map v4): the FPGA starts disarmed and the app never arms on
+ *      its own. Arming is a deliberate action: btnC (re-runs the self-tests,
+ *      clears faults, arms) or 'a' on the console. The FPGA also needs SW15
+ *      up. A latched fault (missed kicks, link errors, btnD e-stop, SW15
+ *      dropped) disarms in hardware; the app reports it and leaves it latched.
+ *
+ * Console (VCP, 115200): a = arm, d = disarm, c = clear faults,
+ *                        k = stop/restart watchdog kicks (to test the watchdog)
  */
 #include <stdio.h>
 #include "fpga_link.h"
 #include "fpga_link_app.h"
 
 extern SPI_HandleTypeDef hspi1;
+extern UART_HandleTypeDef huart2;
 
 #define BURST_TEST_ITERATIONS 2000u   /* 2 x 2000 frames, 32,000 words each way */
-#define WDOG_TIMEOUT_US       5000u   /* 5 control steps without a frame */
 
 static fpga_link_t fpga = {
     .hspi       = &hspi1,
@@ -59,31 +62,36 @@ bool fpga_app_link_up(void)
 
 /* ------------------------------------------------------------------------ */
 /* Control step: one per LOOP_TICK, all in interrupts over SPI DMA          */
-/*   tick ISR     -> burst read 0x04..0x0F (inputs, status, counters, time, */
-/*                   safety)                                               */
-/*   read done    -> burst write 0x03..0x05 (LEDS, SWITCHES = RO, SEG7)      */
-/*   write done   -> if an enabled IRQ is pending, W1C it (1-word burst)    */
+/*   tick ISR       -> burst read SNAP_* 0x30..0x33 (one coherent sample)   */
+/*   snapshot done  -> burst write 0x03..0x05 (LEDS, SWITCHES = RO, SEG7)   */
+/*   outputs done   -> write WDT_KICK (unless kicks are stopped with 'k')   */
+/*   kick done      -> burst read 0x07..0x0B (tick count, IRQs, link stats) */
+/*   status done    -> if an enabled IRQ is pending, W1C it                 */
 /* ------------------------------------------------------------------------ */
-enum { IN_SWITCHES, IN_SEG7, IN_TICK_DIV, IN_TICK_COUNT, IN_IRQ_STATUS,
-       IN_IRQ_ENABLE, IN_FRAMES_OK, IN_CRC_ERRS, IN_TIME_US, IN_CTRL,
-       IN_WDOG, IN_SAFETY, IN_N };
-#define STEP_READ_ADDR   FPGA_REG_SWITCHES
+enum { SNAP_TICK, SNAP_TIME_US, SNAP_INPUTS, SNAP_SAFETY, SNAP_N };
+enum { ST_TICK_COUNT, ST_IRQ_STATUS, ST_IRQ_ENABLE, ST_FRAMES_OK, ST_CRC_ERRS, ST_N };
+#define STEP_STATUS_ADDR FPGA_REG_TICK_COUNT
 #define STEP_WRITE_ADDR  FPGA_REG_LEDS
 #define STEP_WRITE_N     3u   /* LEDS, SWITCHES (read-only: ignored), SEG7 */
+
+enum { STAGE_SNAP, STAGE_OUT, STAGE_KICK, STAGE_STATUS, STAGE_IRQ_CLEAR };
 
 typedef struct {
     uint32_t done, skipped, errors;
     uint32_t lat_min, lat_max;    /* tick edge -> last frame done, cycles */
     uint64_t lat_sum;
     uint64_t cpu_sum;             /* cycles spent in our tick/DMA callbacks */
-    uint32_t in[IN_N];            /* last good read */
+    uint32_t snap[SNAP_N];        /* last good snapshot */
+    uint32_t status[ST_N];        /* last good status read */
 } step_stats_t;
 
-static uint32_t step_in[IN_N];
+static uint32_t step_snap[SNAP_N];
+static uint32_t step_status[ST_N];
 static uint32_t step_out[STEP_WRITE_N];
-static uint32_t step_irq_clear;
+static uint32_t step_stage;
 static volatile bool step_enabled;   /* off during init and self-tests */
 static volatile bool step_active;    /* this step's frames are in flight */
+static volatile bool step_kick = true;
 static uint32_t step_t0, step_cpu;
 static step_stats_t step_stats;      /* written in ISRs; read via step_snapshot() */
 
@@ -118,42 +126,59 @@ static void step_end(bool ok)
     step_active = false;
 }
 
-static void step_written(fpga_link_t *l, fpga_status_t st)
+/* DMA completion of each frame in the step: start the next one, or finish */
+static void step_next(fpga_link_t *l, fpga_status_t st)
 {
     uint32_t c0 = DWT->CYCCNT;
     bool ok = (st == FPGA_OK), more = false;
-
-    if (ok && step_irq_clear) {
-        uint32_t v = step_irq_clear;   /* copied by the driver */
-        step_irq_clear = 0;
-        ok = more = (fpga_write_burst_async(l, FPGA_REG_IRQ_STATUS, &v, 1,
-                                            step_written) == FPGA_OK);
-    }
-    step_cpu += DWT->CYCCNT - c0;
-    if (!more)
-        step_end(ok);
-}
-
-static void step_read_done(fpga_link_t *l, fpga_status_t st)
-{
-    uint32_t c0 = DWT->CYCCNT;
-    bool ok = (st == FPGA_OK);
+    fpga_status_t r = FPGA_OK;
+    uint32_t v = 0;               /* single words are copied by the driver */
 
     if (ok) {
-        /* The "control law": LEDs follow the switches, display shows ticks */
-        step_out[0] = step_in[IN_SWITCHES] & FPGA_SW_MASK;
-        step_out[1] = 0;
-        step_out[2] = FPGA_SEG7_USE_REG | FPGA_SEG7_ALL_DIGITS |
-                      (tick_isr_count & 0xFFFFu);
-        step_irq_clear = step_in[IN_IRQ_STATUS] & step_in[IN_IRQ_ENABLE];
-        for (uint32_t i = 0; i < IN_N; i++)
-            step_stats.in[i] = step_in[i];
-        ok = (fpga_write_burst_async(l, STEP_WRITE_ADDR, step_out, STEP_WRITE_N,
-                                     step_written) == FPGA_OK);
+        switch (step_stage) {
+        case STAGE_SNAP:
+            /* The "control law": LEDs follow the switches, display shows ticks */
+            for (uint32_t i = 0; i < SNAP_N; i++)
+                step_stats.snap[i] = step_snap[i];
+            step_out[0] = step_snap[SNAP_INPUTS] & FPGA_LEDS_VALUE;
+            step_out[1] = 0;
+            step_out[2] = FPGA_SEG7_USE_REG | FPGA_SEG7_ALL_DIGITS |
+                          (step_snap[SNAP_TICK] & 0xFFFFu);
+            step_stage = STAGE_OUT;
+            more = true;
+            r = fpga_write_burst_async(l, STEP_WRITE_ADDR, step_out, STEP_WRITE_N, step_next);
+            break;
+        case STAGE_OUT:
+            if (step_kick) {
+                step_stage = STAGE_KICK;
+                more = true;
+                r = fpga_write_burst_async(l, FPGA_REG_WDT_KICK, &v, 1, step_next);
+                break;
+            }
+            /* fall through */
+        case STAGE_KICK:
+            step_stage = STAGE_STATUS;
+            more = true;
+            r = fpga_read_burst_async(l, STEP_STATUS_ADDR, step_status, ST_N, step_next);
+            break;
+        case STAGE_STATUS:
+            for (uint32_t i = 0; i < ST_N; i++)
+                step_stats.status[i] = step_status[i];
+            v = step_status[ST_IRQ_STATUS] & step_status[ST_IRQ_ENABLE];
+            if (v) {
+                step_stage = STAGE_IRQ_CLEAR;
+                more = true;
+                r = fpga_write_burst_async(l, FPGA_REG_IRQ_STATUS, &v, 1, step_next);
+            }
+            break;
+        default:
+            break;
+        }
+        ok = (r == FPGA_OK);
     }
     step_cpu += DWT->CYCCNT - c0;
-    if (!ok)
-        step_end(false);
+    if (!(more && ok))
+        step_end(ok);
 }
 
 static void step_start(uint32_t now)
@@ -167,8 +192,9 @@ static void step_start(uint32_t now)
     step_active = true;
     step_t0 = now;
     step_cpu = 0;
-    if (fpga_read_burst_async(&fpga, STEP_READ_ADDR, step_in, IN_N,
-                              step_read_done) != FPGA_OK) {
+    step_stage = STAGE_SNAP;
+    if (fpga_read_burst_async(&fpga, FPGA_REG_SNAP_TICK, step_snap, SNAP_N,
+                              step_next) != FPGA_OK) {
         step_active = false;      /* link busy (main-loop transfer) or SPI error */
         step_stats.skipped++;
         return;
@@ -236,19 +262,89 @@ static void tick_stats_reset(void)
     __set_PRIMASK(primask);
 }
 
-/* Watchdog on, then outputs on (clearing any latched FAULT). The control step
- * must be running, or about to, so the watchdog keeps getting frames. */
-static void safety_arm(void)
+/* ------------------------------------------------------------------------ */
+/* Safety (map v4). These use blocking frames, so call them from the main   */
+/* loop with the control step paused (see safety_cmd).                      */
+/* ------------------------------------------------------------------------ */
+static void print_faults(uint32_t f)
 {
-    fpga_write(&fpga, FPGA_REG_WDOG, WDOG_TIMEOUT_US);
-    fpga_write(&fpga, FPGA_REG_SAFETY, FPGA_SAFETY_FAULT | FPGA_SAFETY_OUT_EN);
+    printf("%s%s%s%s%s",
+           f ? "" : " none",
+           (f & FPGA_FAULT_WDT)      ? " WDT(missed kicks)" : "",
+           (f & FPGA_FAULT_LINK)     ? " LINK(rejected frames)" : "",
+           (f & FPGA_FAULT_ESTOP)    ? " ESTOP(btnD)" : "",
+           (f & FPGA_FAULT_ARM_LOST) ? " ARM_LOST(SW15 down)" : "");
 }
 
-/* Outputs off, then watchdog off: for deliberate pauses (self-tests) */
+/* Ask the FPGA to arm, then say whether it did (and if not, why) */
+static void safety_arm(void)
+{
+    uint32_t arm = 0, faults = 0;
+
+    step_kick = true;
+    fpga_write(&fpga, FPGA_REG_ARM, FPGA_ARM_KEY);
+    fpga_read(&fpga, FPGA_REG_ARM, &arm);
+    if (arm & FPGA_ARM_ARMED) {
+        printf("safety: armed\r\n");
+        return;
+    }
+    fpga_read(&fpga, FPGA_REG_FAULT_STATUS, &faults);
+    printf("safety: arm refused:%s%s%s\r\n",
+           (arm & FPGA_ARM_SW_EN) ? "" : " SW15 is down;",
+           (arm & FPGA_ARM_TICK_ON) ? "" : " tick not running;",
+           (arm & FPGA_ARM_FAULT) ? " fault latched (c clears):" : "");
+    if (arm & FPGA_ARM_FAULT) {
+        printf("  faults:");
+        print_faults(faults);
+        printf("\r\n");
+    }
+}
+
 static void safety_disarm(void)
 {
-    fpga_write(&fpga, FPGA_REG_SAFETY, 0);
-    fpga_write(&fpga, FPGA_REG_WDOG, 0);
+    fpga_write(&fpga, FPGA_REG_ARM, 0);
+}
+
+static void safety_clear_faults(void)
+{
+    uint32_t faults = 0;
+
+    fpga_write(&fpga, FPGA_REG_FAULT_CLEAR, FPGA_FAULT_WDT | FPGA_FAULT_LINK |
+                                            FPGA_FAULT_ESTOP | FPGA_FAULT_ARM_LOST);
+    fpga_read(&fpga, FPGA_REG_FAULT_STATUS, &faults);
+    printf("safety: faults cleared; still latched:");
+    print_faults(faults);
+    printf("\r\n");
+}
+
+/* Run one console command with the control step paused, so its blocking
+ * frames don't collide with the step's DMA frames */
+static void safety_cmd(char c)
+{
+    steps_pause();
+    switch (c) {
+    case 'a': safety_arm(); break;
+    case 'd': safety_disarm(); printf("safety: disarmed\r\n"); break;
+    case 'c': safety_clear_faults(); break;
+    case 'k':
+        step_kick = !step_kick;
+        printf("safety: watchdog kicks %s\r\n", step_kick ? "on" : "OFF (expect FAULT WDT)");
+        break;
+    default: break;
+    }
+    step_enabled = true;
+}
+
+/* One console byte, if any (polled; the VCP is otherwise only written) */
+static int console_getc(void)
+{
+    USART_TypeDef *u = huart2.Instance;
+
+    if (u->ISR & USART_ISR_ORE)
+        u->ICR = USART_ICR_ORECF;
+    if (u->ISR & USART_ISR_RXNE_RXFNE)
+        return (int)(u->RDR & 0xFFu);
+    return -1;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -310,7 +406,7 @@ void fpga_app_init(void)
 
     fpga_write(&fpga, FPGA_REG_IRQ_STATUS, 0xF);
     fpga_write(&fpga, FPGA_REG_IRQ_ENABLE,
-               FPGA_IRQ_INPUTS | FPGA_IRQ_CRC_ERR | FPGA_IRQ_WDOG);
+               FPGA_IRQ_INPUTS | FPGA_IRQ_CRC_ERR | FPGA_IRQ_FAULT);
 
     /* Forget ticks that arrived from the previous run before fpga_init reset
      * the FPGA: they made the period max and the MCU/FPGA counts disagree.
@@ -318,20 +414,20 @@ void fpga_app_init(void)
     tick_stats_reset();
     step_stats_reset();
 
-    /* Arm, then start the 1 kHz loop tick (tick IRQ off: it has its own
-     * line). The first step's frames arrive within 1 ms, well inside the
-     * watchdog timeout. */
-    safety_arm();
+    /* Start the 1 kHz loop tick (tick IRQ off: it has its own line) and the
+     * control step. The FPGA stays disarmed until the user arms it. */
     fpga_write(&fpga, FPGA_REG_TICK_DIV, FPGA_TICK_DIV_FOR_HZ(1000));
     step_enabled = true;
+    printf("safety: disarmed; SW15 up, then btnC or 'a' to arm\r\n");
 }
 
 void fpga_app_poll(void)
 {
     static uint32_t last_print;
     static uint32_t last_btn;
-    static uint32_t last_fault;
+    static uint32_t last_faults;
     step_stats_t s;
+    int c;
 
     if (!link_up) {
         /* Retry init every 2 s so the bitstream can be loaded after the MCU */
@@ -342,28 +438,35 @@ void fpga_app_poll(void)
         return;
     }
 
-    step_snapshot(&s);
+    if ((c = console_getc()) >= 0)
+        safety_cmd((char)c);
 
-    /* btnC: pause the control step, re-run the self-tests, re-arm */
-    uint32_t btn_c = s.in[IN_SWITCHES] & FPGA_BTN_C;
+    step_snapshot(&s);
+    uint32_t safety = s.snap[SNAP_SAFETY];
+    uint32_t faults = (safety >> FPGA_SNAP_FAULT_LSB) & 0xFu;
+
+    /* btnC: pause the control step, re-run the self-tests, clear faults, arm */
+    uint32_t btn_c = s.snap[SNAP_INPUTS] & FPGA_BTN_C;
     if (btn_c && !last_btn) {
         steps_pause();
         safety_disarm();
         run_selftest();
         fpga_write(&fpga, FPGA_REG_CTRL, FPGA_CTRL_CLEAR_COUNTERS);
         tick_stats_reset();
+        safety_clear_faults();
         safety_arm();
         step_enabled = true;
-        printf("safety: re-armed\r\n");
     }
     last_btn = btn_c;
 
-    /* A latched watchdog fault means the FPGA lost the MCU for > 5 ms.
-     * Report it once; leave it latched until btnC re-arms. */
-    uint32_t fault = s.in[IN_SAFETY] & FPGA_SAFETY_FAULT;
-    if (fault && !last_fault)
-        printf("SAFETY FAULT: watchdog expired, FPGA outputs off; press btnC to re-arm\r\n");
-    last_fault = fault;
+    /* Report each newly latched fault once; it stays latched until the user
+     * clears it (btnC or 'c') */
+    if (faults & ~last_faults) {
+        printf("SAFETY FAULT:");
+        print_faults(faults & ~last_faults);
+        printf("; outputs off. Clear with btnC or 'c', then arm\r\n");
+    }
+    last_faults = faults;
 
     if (HAL_GetTick() - last_print >= 1000u) {
         last_print = HAL_GetTick();
@@ -372,10 +475,10 @@ void fpga_app_poll(void)
         /* Tick period min/max in ns: shows LOOP_TICK + EXTI latency jitter */
         printf("ticks MCU %lu / FPGA %lu, period %lu..%lu ns, frames %lu, "
                "FPGA CRC errs %lu, MCU CRC errs %lu, IRQs %lu\r\n",
-               (unsigned long)tick_isr_count, (unsigned long)s.in[IN_TICK_COUNT],
+               (unsigned long)tick_isr_count, (unsigned long)s.status[ST_TICK_COUNT],
                (unsigned long)(tick_min_cyc * 1000u / cyc_per_us),
                (unsigned long)(tick_max_cyc * 1000u / cyc_per_us),
-               (unsigned long)s.in[IN_FRAMES_OK], (unsigned long)s.in[IN_CRC_ERRS],
+               (unsigned long)s.status[ST_FRAMES_OK], (unsigned long)s.status[ST_CRC_ERRS],
                (unsigned long)fpga.crc_errors, (unsigned long)irq_isr_count);
 
         if (s.done)
@@ -388,9 +491,10 @@ void fpga_app_poll(void)
                    (unsigned long)(s.lat_sum * 1000u / cyc_per_us / s.done),
                    (unsigned long)(s.cpu_sum * 1000u / cyc_per_us / s.done));
 
-        printf("safety: outputs %s, fault %lu, wdog %lu us\r\n",
-               (s.in[IN_SAFETY] & FPGA_SAFETY_OUT_EN) ? "on" : "off",
-               (unsigned long)((s.in[IN_SAFETY] & FPGA_SAFETY_FAULT) ? 1u : 0u),
-               (unsigned long)s.in[IN_WDOG]);
+        printf("safety: %s, SW15 %s, kicks %s, faults 0x%lX\r\n",
+               (safety & FPGA_ARM_ARMED) ? "armed" : "disarmed",
+               (safety & FPGA_ARM_SW_EN) ? "up" : "down",
+               step_kick ? "on" : "off",
+               (unsigned long)faults);
     }
 }

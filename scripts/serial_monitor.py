@@ -5,10 +5,13 @@
     python scripts/serial_monitor.py --reset          # reset the MCU first (needs STM32_Programmer_CLI)
     python scripts/serial_monitor.py --seconds 30 --port COM5
     python scripts/serial_monitor.py --list           # show serial ports
+    python scripts/serial_monitor.py --reset --arm    # also arm (SW15 must be up); expects armed
+    python scripts/serial_monitor.py --cmd 20:k --cmd 25:c   # console bytes at t = 20 s, 25 s
 
 Needs pyserial (pip install pyserial). Writes everything to build/serial.log
 and ends with a RESULT line:
-  OK      - init OK, both self-tests clean, ticks counting, no CRC errors
+  OK      - init OK, both self-tests clean, ticks counting, no CRC errors,
+            no safety fault (and armed, with --arm)
   PARTIAL - some checks passed (details listed)
   FAILED  - no output, or init failed
 Without --reset you only see the init/self-test lines if you press the
@@ -40,7 +43,8 @@ SELFTEST_RE = re.compile(r"^\s*(\S.*?): (\d+) iterations in (\d+) ms, mismatches
                          r"MCU CRC errors (\d+), FPGA CRC errors (\d+), SPI errors (\d+)")
 STEP_RE = re.compile(r"step: done (\d+), skipped (\d+), errors (\d+), latency (\d+)\.\.(\d+) ns "
                      r"\(avg (\d+)\), callback CPU avg (\d+) ns")
-SAFETY_RE = re.compile(r"safety: outputs (on|off), fault (\d+), wdog (\d+) us")
+SAFETY_RE = re.compile(r"safety: (armed|disarmed), SW15 (up|down), kicks (on|off), faults 0x([0-9A-F]+)")
+BOOT_DISARMED = "safety: disarmed; SW15 up"   # the firmware is ready for 'a'
 
 
 def find_port():
@@ -86,7 +90,7 @@ def parse_selftests(lines):
     return found
 
 
-def judge(lines):
+def judge(lines, expect_armed=False):
     init_ok = any(l.strip() == "Init: OK" for l in lines)
     init_fail = [l.strip() for l in lines if l.startswith("Init: ") and l.strip() != "Init: OK"]
     selftests = parse_selftests(lines)
@@ -146,14 +150,15 @@ def judge(lines):
         checks.append(("Control step on every tick (SPI DMA)", False,
                        f"only {len(steps)} step line(s) seen"))
 
+    name = "Safety armed, no fault" if expect_armed else "Safety: no fault latched"
     if safety:
         m = safety[-1]
-        armed = m.group(1) == "on" and m.group(2) == "0" and int(m.group(3)) > 0
-        checks.append(("Safety armed, no watchdog fault", armed and not faults,
-                       f"outputs {m.group(1)}, fault {m.group(2)}, wdog {m.group(3)} us"
-                       + (f"; {len(faults)} SAFETY FAULT line(s)" if faults else "")))
+        clean = m.group(4) == "0" and not faults and (m.group(1) == "armed" or not expect_armed)
+        checks.append((name, clean,
+                       f"{m.group(1)}, SW15 {m.group(2)}, kicks {m.group(3)}, faults 0x{m.group(4)}"
+                       + (f"; {len(faults)} SAFETY FAULT line(s): {faults[-1]}" if faults else "")))
     else:
-        checks.append(("Safety armed, no watchdog fault", False, "no safety line seen"))
+        checks.append((name, False, "no safety line seen"))
 
     print("\n--- Bring-up checks ---")
     for name, ok, detail in checks:
@@ -175,6 +180,10 @@ def main():
     ap.add_argument("--seconds", type=float, default=15.0)
     ap.add_argument("--reset", action="store_true", help="reset the MCU after opening the port")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--arm", action="store_true",
+                    help="send 'a' once the firmware is up (SW15 must be up) and expect it armed")
+    ap.add_argument("--cmd", action="append", default=[], metavar="SECONDS:CHAR",
+                    help="send a console byte at a time into the run, e.g. 20:k (repeatable)")
     a = ap.parse_args()
 
     if a.list:
@@ -192,14 +201,22 @@ def main():
     log_path = os.path.join(ROOT, "build", "serial.log")
     print(f"Listening on {port} at {a.baud} baud for {a.seconds:.0f} s (log: {log_path})")
 
+    cmds = sorted((float(s.split(":", 1)[0]), s.split(":", 1)[1].encode()) for s in a.cmd)
     lines = []
     with serial.Serial(port, a.baud, timeout=0.2) as ser, open(log_path, "w") as log:
         ser.reset_input_buffer()
         if a.reset:
             reset_mcu()
-        end = time.time() + a.seconds
+        start = time.time()
+        end = start + a.seconds
+        arm_pending = a.arm
+        if arm_pending and not a.reset:      # firmware already running
+            ser.write(b"a")
+            arm_pending = False
         buf = b""
         while time.time() < end:
+            while cmds and time.time() - start >= cmds[0][0]:
+                ser.write(cmds.pop(0)[1])
             buf += ser.read(512)
             while b"\n" in buf:
                 raw, buf = buf.split(b"\n", 1)
@@ -208,8 +225,11 @@ def main():
                 print(line)
                 log.write(line + "\n")
                 log.flush()
+                if arm_pending and line.startswith(BOOT_DISARMED):
+                    ser.write(b"a")
+                    arm_pending = False
 
-    verdict = judge(lines)
+    verdict = judge(lines, expect_armed=a.arm)
     print(f"\nRESULT: {verdict}")
     return 0 if verdict.startswith("OK") else 1
 

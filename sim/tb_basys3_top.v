@@ -12,7 +12,7 @@ module tb_basys3_top;
     reg clk = 1'b0;
     always #5 clk = ~clk;   // 100 MHz
 
-    reg  [15:0] sw = 16'h0;
+    reg  [15:0] sw = 16'h8000;   // SW15 up: hardware arm enable
     reg  btnC = 0, btnU = 0, btnL = 0, btnR = 0, btnD = 0;
     wire [15:0] led;
     wire [6:0]  seg;
@@ -246,7 +246,7 @@ module tb_basys3_top;
             bw[1] = 32'h0000_3C3C;
             burst_write(7'h02, 2, 8'd1, 1'b0, 1'b0, 0);
             #20;
-            check("LED pins by burst write", {16'h0, led}, 32'h0000_3C3C);
+            check("LED pins by burst write", {16'h0, led}, 32'h0000_BC3C);   // LED15 = armed
             read_expect("SCRATCH by burst write", 7'h02, bw[0]);
 
             // N = 1
@@ -258,7 +258,7 @@ module tb_basys3_top;
             burst_read(7'h00, 2, 8'd1, 1'b0, ok);
             check("burst ID+VERSION (crc)", {31'h0, ok}, 32'h1);
             check("burst ID", br[0], 32'h4734_4650);
-            check("burst VERSION", br[1], 32'h0000_0003);
+            check("burst VERSION", br[1], 32'h0000_0004);
 
             // Addresses wrap: 0x7E, 0x7F, 0x00
             burst_read(7'h7E, 3, 8'd2, 1'b0, ok);
@@ -282,7 +282,7 @@ module tb_basys3_top;
             $display("SPI %.1f MHz, MISO delay %.0f ns", 1000.0 / (2.0 * hp), delay);
 
             read_expect("ID", 7'h00, 32'h4734_4650);
-            read_expect("VERSION", 7'h01, 32'h0000_0003);
+            read_expect("VERSION", 7'h01, 32'h0000_0004);
 
             // Scratch: walking patterns
             for (i = 0; i < 32; i = i + 1) begin
@@ -295,11 +295,11 @@ module tb_basys3_top;
             reg_write(7'h02, 32'h0000_0000, 1'b0);
             read_expect("SCRATCH zeros", 7'h02, 32'h0000_0000);
 
-            // LEDs drive the pins
-            reg_write(7'h03, 32'h0000_A5C3, 1'b0);
+            // LEDs drive the pins: [13:0] from LEDS, LED15 = armed, LED14 = fault
+            reg_write(7'h03, 32'h0000_E5C3, 1'b0);
             #20;
             check("LED pins", {16'h0, led}, 32'h0000_A5C3);
-            read_expect("LEDS", 7'h03, 32'h0000_A5C3);
+            read_expect("LEDS (14 bits)", 7'h03, 32'h0000_25C3);
 
             // Unmapped address (0x7F is the burst escape, so use 0x7E)
             read_expect("unmapped", 7'h7E, 32'hDEAD_BEEF);
@@ -318,9 +318,40 @@ module tb_basys3_top;
     endtask
 
     // ------------------------------------------------------------------
+    // Safety layer helpers (map v4)
+    // ------------------------------------------------------------------
+    localparam [31:0] ARM_KEY = 32'h4152_4D21;
+
+    task wait_inputs;   // switches/buttons are sampled every 1 ms
+        #(2_100_000);
+    endtask
+
+    task arm;
+        reg [31:0] d;
+        reg ok;
+        begin
+            reg_write(7'h20, ARM_KEY, 1'b0);
+            reg_read(7'h20, 1'b0, d, ok);
+            check("armed", d & 32'h1, 32'h1);
+        end
+    endtask
+
+    task snap_read(output [31:0] s0, output [31:0] s1, output [31:0] s2, output [31:0] s3);
+        reg ok;
+        begin
+            burst_read(7'h30, 4, 8'd3, 1'b0, ok);
+            check("snapshot burst (crc)", {31'h0, ok}, 32'h1);
+            s0 = br[0]; s1 = br[1]; s2 = br[2]; s3 = br[3];
+        end
+    endtask
+
+    // ------------------------------------------------------------------
     // Main sequence
     // ------------------------------------------------------------------
     reg [31:0] d, prev_cnt, t0, t1;
+    reg [31:0] s_a [0:3];
+    reg [31:0] s_b [0:3];
+    reg [31:0] s_c [0:3];
     reg ok;
     integer pulses;
     integer pulse_width;
@@ -328,14 +359,23 @@ module tb_basys3_top;
 
     always @(posedge tick) pulses = pulses + 1;
 
+    // Safety invariant on every clock: never armed while a fault is latched
+    // (a one-clock arm would be a glitch on every actuator output)
+    integer armed_with_fault = 0;
+    always @(posedge clk)
+        if (dut.u_regs.armed && dut.fault_any)
+            armed_with_fault = armed_with_fault + 1;
+
     initial begin
         pulses = 0;
         $display("=== SPI link testbench ===");
-        #(4000);   // past power-on reset
+        wait_inputs;   // past power-on reset, SW15 sampled
 
-        // Outputs (LED pins) stay off until SAFETY.OUT_EN; enable them for
-        // the link tests. The watchdog is off after reset.
-        reg_write(7'h0F, 32'h1, 1'b0);
+        // Outputs (LED pins) stay off until armed. Arm for the link tests
+        // with a 100 ms tick, so the watchdog never comes due during them.
+        check("LED pins off before arming", {16'h0, led}, 32'h0);
+        reg_write(7'h06, 32'd10_000_000, 1'b0);
+        arm;
 
         // Speeds: 5.3 MHz (prescaler /32), 10.6 MHz (/16), 12.5 MHz stress
         link_suite(94.0, 8.0);
@@ -408,54 +448,164 @@ module tb_basys3_top;
         reg_read(7'h0B, 1'b0, d, ok);
         check("CRC_ERRS +2 after bad burst reads", d - prev_cnt, 32'd2);
 
+        check("3 rejected frames in a row don't trip LINK", {31'h0, dut.fault_any}, 32'h0);
+        read_expect("still armed after error tests", 7'h20, 32'hB);
+
         // Single frames still work right after a burst
         burst_write(7'h10, 1, 8'd0, 1'b0, 1'b0, 0);
         reg_write(7'h02, 32'h5EED_5EED, 1'b0);
         read_expect("single write right after a burst", 7'h02, 32'h5EED_5EED);
 
-        // Safety watchdog
-        $display("Safety watchdog");
+        // Safety layer (map v4)
+        $display("Safety layer");
         reg_write(7'h03, 32'h0000_00FF, 1'b0);
-        reg_write(7'h0F, 32'h0, 1'b0);
+        read_expect("ARM: armed, SW15, tick on", 7'h20, 32'hB);
+        read_expect("FAULT_STATUS clear", 7'h22, 32'h0);
+        reg_write(7'h06, 32'd1000, 1'b0);
+        read_expect("TICK_DIV locked while armed", 7'h06, 32'd10_000_000);
+        reg_write(7'h21, 32'd7, 1'b0);
+        read_expect("WDT_TICKS locked while armed", 7'h21, 32'd3);
+
+        reg_write(7'h20, 32'h0, 1'b0);                    // any other value disarms
+        read_expect("disarmed by ARM write", 7'h20, 32'hA);
         #20;
-        check("LED pins off with OUT_EN = 0", {16'h0, led}, 32'h0);
+        check("LED pins off when disarmed", {16'h0, led}, 32'h0);
         read_expect("LEDS still reads the commanded value", 7'h03, 32'h0000_00FF);
-        reg_write(7'h0F, 32'h1, 1'b0);
+        check("no fault from a commanded disarm", {31'h0, dut.fault_any}, 32'h0);
+
+        reg_write(7'h20, ARM_KEY ^ 32'h1, 1'b0);          // wrong key
+        read_expect("wrong key refused", 7'h20, 32'hA);
+        reg_write(7'h06, 32'd0, 1'b0);                    // tick off
+        reg_write(7'h20, ARM_KEY, 1'b0);
+        read_expect("arming refused with tick off", 7'h20, 32'h2);
+        reg_write(7'h21, 32'd0, 1'b0);
+        read_expect("WDT_TICKS 0 stored as 1", 7'h21, 32'd1);
+        reg_write(7'h21, 32'd3, 1'b0);
+
+        // Watchdog: 20 us ticks, limit 3. Only WDT_KICK feeds it.
+        reg_write(7'h08, 32'hF, 1'b0);
+        reg_write(7'h09, 32'h8, 1'b0);                    // fault IRQ only
+        reg_write(7'h06, 32'd2000, 1'b0);
+        arm;
         #20;
-        check("LED pins on with OUT_EN = 1", {16'h0, led}, 32'h0000_00FF);
-
-        reg_write(7'h08, 32'hF, 1'b0);            // clear all IRQs
-        reg_write(7'h09, 32'h8, 1'b0);            // watchdog IRQ only
-        reg_write(7'h0E, 32'd50, 1'b0);           // 50 us timeout
-        read_expect("WDOG", 7'h0E, 32'd50);
-        for (i = 0; i < 30; i = i + 1)            // ~170 us of traffic
-            reg_read(7'h0F, 1'b0, d, ok);
-        read_expect("SAFETY armed while frames keep coming", 7'h0F, 32'h1);
-        check("no watchdog IRQ while fed", {31'h0, irq}, 32'h0);
-
-        #(80_000);                                // silence: expires at 50 us
-        check("LED pins off after expiry", {16'h0, led}, 32'h0);
-        check("FAULT latched", {31'h0, dut.safety_fault}, 32'h1);
+        check("LED pins on when armed", {16'h0, led}, 32'h0000_80FF);
+        for (i = 0; i < 15; i = i + 1) begin
+            @(posedge tick);
+            #(2000);
+            reg_write(7'h24, 32'h0, 1'b0);
+        end
+        read_expect("armed while kicked", 7'h20, 32'hB);
+        check("no fault IRQ while kicked", {31'h0, irq}, 32'h0);
+        @(posedge tick);
+        #(2000);
+        reg_write(7'h24, 32'h0, 1'b0);                    // last kick at T
+        t0 = $time;
+        while ($time - t0 < 50_000)                       // frames, but no kicks
+            reg_read(7'h02, 1'b0, d, ok);
+        while ($time - t0 < 52_000) #100;
+        read_expect("armed ~2.9 periods after the last kick", 7'h20, 32'hB);
+        #(26_000);                                        // past T + 4 periods
+        check("FAULT.WDT latched", {28'h0, dut.u_regs.fault_st}, 32'h1);
+        check("LED pins: fault on, armed off, outputs off", {16'h0, led}, 32'h0000_4000);
         check("FAULT_N low while latched", {31'h0, fault_n}, 32'h0);
-        check("watchdog IRQ", {31'h0, irq}, 32'h1);
-        read_expect("SAFETY = FAULT, OUT_EN cleared", 7'h0F, 32'h2);
+        check("fault IRQ", {31'h0, irq}, 32'h1);
+        read_expect("ARM: disarmed, fault", 7'h20, 32'hE);
+        read_expect("FAULT_STATUS = WDT", 7'h22, 32'h1);
+        read_expect("WDT_KICK reads 0 when disarmed", 7'h24, 32'h0);
 
-        reg_write(7'h0F, 32'h1, 1'b0);            // OUT_EN alone is refused
-        read_expect("OUT_EN refused while FAULT", 7'h0F, 32'h2);
-        #20;
-        check("LED pins stay off", {16'h0, led}, 32'h0);
-
-        reg_write(7'h0F, 32'h3, 1'b0);            // clear FAULT and enable together
-        read_expect("SAFETY re-armed", 7'h0F, 32'h1);
-        #20;
-        check("FAULT cleared", {31'h0, dut.safety_fault}, 32'h0);
-        check("LED pins back on", {16'h0, led}, 32'h0000_00FF);
-
-        reg_write(7'h0E, 32'd0, 1'b0);            // timeout 0 = off
-        #(80_000);
-        read_expect("no trip with WDOG = 0", 7'h0F, 32'h1);
+        reg_write(7'h20, ARM_KEY, 1'b0);
+        read_expect("arming refused while fault latched", 7'h20, 32'hE);
+        reg_write(7'h23, 32'h2, 1'b0);                    // wrong bit
+        read_expect("FAULT_CLEAR of another bit keeps WDT", 7'h22, 32'h1);
+        reg_write(7'h23, 32'h1, 1'b0);
+        read_expect("FAULT_CLEAR clears WDT", 7'h22, 32'h0);
+        check("fault_any cleared", {31'h0, dut.fault_any}, 32'h0);
         reg_write(7'h08, 32'h8, 1'b0);
         reg_write(7'h09, 32'h0, 1'b0);
+
+        // Slow tick (1 ms) for the remaining faults, so frames in between
+        // don't need kicks
+        reg_write(7'h06, 32'd100_000, 1'b0);
+
+        // LINK: 4 rejected frames in a row
+        arm;
+        reg_write(7'h02, 32'h0, 1'b1);
+        reg_write(7'h02, 32'h0, 1'b1);
+        reg_write(7'h02, 32'h0, 1'b1);
+        reg_write(7'h24, 32'h0, 1'b0);                    // a good frame resets the run
+        reg_write(7'h02, 32'h0, 1'b1);
+        reg_write(7'h02, 32'h0, 1'b1);
+        reg_write(7'h02, 32'h0, 1'b1);
+        read_expect("armed: never 4 bad frames in a row", 7'h20, 32'hB);
+        for (i = 0; i < 4; i = i + 1)
+            reg_write(7'h02, 32'h0, 1'b1);
+        read_expect("FAULT_STATUS = LINK", 7'h22, 32'h2);
+        read_expect("disarmed by LINK", 7'h20, 32'hE);
+        reg_write(7'h23, 32'hF, 1'b0);
+        read_expect("LINK cleared", 7'h22, 32'h0);
+
+        // E-stop (btnD): latches, can't be cleared while held
+        arm;
+        reg_write(7'h24, 32'h0, 1'b0);
+        btnD = 1'b1;
+        wait_inputs;
+        check("LED pins after e-stop", {16'h0, led}, 32'h0000_4000);
+        read_expect("FAULT_STATUS = ESTOP", 7'h22, 32'h4);
+        reg_write(7'h23, 32'hF, 1'b0);
+        read_expect("ESTOP not cleared while held", 7'h22, 32'h4);
+        reg_write(7'h20, ARM_KEY, 1'b0);
+        read_expect("arming refused during e-stop", 7'h20, 32'hE);
+        btnD = 1'b0;
+        wait_inputs;
+        read_expect("ESTOP stays latched after release", 7'h22, 32'h4);
+        reg_write(7'h23, 32'h4, 1'b0);
+        read_expect("ESTOP cleared after release", 7'h22, 32'h0);
+
+        // ARM_LOST: SW15 down while armed
+        arm;
+        reg_write(7'h24, 32'h0, 1'b0);
+        sw[15] = 1'b0;
+        wait_inputs;
+        read_expect("FAULT_STATUS = ARM_LOST", 7'h22, 32'h8);
+        read_expect("ARM: disarmed, SW15 down, fault", 7'h20, 32'hC);
+        reg_write(7'h23, 32'h8, 1'b0);
+        reg_write(7'h20, ARM_KEY, 1'b0);
+        read_expect("arming refused with SW15 down", 7'h20, 32'h8);
+        check("SW15 down while disarmed is no fault", {31'h0, dut.fault_any}, 32'h0);
+        sw[15] = 1'b1;
+        wait_inputs;
+        arm;
+
+        // Snapshot: one consistent sample per tick, even when a tick lands
+        // in the middle of a burst read (20 us ticks)
+        reg_write(7'h20, 32'h0, 1'b0);
+        reg_write(7'h06, 32'd2000, 1'b0);
+        @(posedge tick);
+        #(1000);
+        snap_read(s_a[0], s_a[1], s_a[2], s_a[3]);
+        reg_read(7'h07, 1'b0, d, ok);
+        check("SNAP_TICK = TICK_COUNT", s_a[0], d);
+        check("SNAP_INPUTS = switches at the tick", s_a[2], 32'h0000_8000);
+        check("SNAP_SAFETY = ARM bits at the tick", s_a[3], 32'h0000_000A);
+        reg_read(7'h0C, 1'b0, d, ok);
+        if (d - s_a[1] > 32'd30) begin                  // two reads since the tick
+            errors = errors + 1;
+            $display("  FAIL SNAP_TIME_US %0d us old", d - s_a[1]);
+        end
+        checks = checks + 1;
+        @(posedge tick);
+        t0 = $time;
+        #(1000);
+        snap_read(s_a[0], s_a[1], s_a[2], s_a[3]);        // between ticks
+        while ($time - t0 < 15_000) #100;                 // next tick ~5 us into B
+        snap_read(s_b[0], s_b[1], s_b[2], s_b[3]);
+        check("a tick fired during burst B", {31'h0, dut.u_regs.tick_count == s_a[0] + 1}, 32'h1);
+        for (i = 0; i < 4; i = i + 1)
+            check("mid-burst tick: B is the same sample as A", s_b[i], s_a[i]);
+        snap_read(s_c[0], s_c[1], s_c[2], s_c[3]);
+        check("after the burst: next SNAP_TICK", s_c[0], s_a[0] + 1);
+        check("next snapshot 20 us later", s_c[1] - s_a[1], 32'd20);
+        reg_write(7'h06, 32'd0, 1'b0);
 
         // IRQ: CRC error bit (bit 2), enabled after the fact
         reg_write(7'h08, 32'h7, 1'b0);            // clear all
@@ -529,14 +679,24 @@ module tb_basys3_top;
         #(500);
         read_expect("SCRATCH cleared by FPGA_RST_N", 7'h02, 32'h0);
         read_expect("LEDS cleared by FPGA_RST_N", 7'h03, 32'h0);
-        reg_write(7'h0E, 32'd50, 1'b0);
-        reg_write(7'h0F, 32'h1, 1'b0);
+        reg_write(7'h06, 32'd100_000, 1'b0);
+        reg_write(7'h21, 32'd9, 1'b0);
+        arm;
+        btnD = 1'b1;
+        wait_inputs;
+        btnD = 1'b0;
+        wait_inputs;
+        read_expect("ESTOP latched before reset", 7'h22, 32'h4);
         rst_n = 1'b0;
         #(500);
         rst_n = 1'b1;
         #(500);
-        read_expect("WDOG off after FPGA_RST_N", 7'h0E, 32'h0);
-        read_expect("SAFETY off after FPGA_RST_N", 7'h0F, 32'h0);
+        read_expect("ARM after FPGA_RST_N: disarmed, tick off", 7'h20, 32'h2);
+        read_expect("FAULT_STATUS cleared by FPGA_RST_N", 7'h22, 32'h0);
+        read_expect("WDT_TICKS back to 3", 7'h21, 32'd3);
+        read_expect("v3 WDOG address now unmapped", 7'h0E, 32'hDEAD_BEEF);
+
+        check("never armed while a fault is latched (clocks)", armed_with_fault, 32'd0);
 
         checks = checks + 1;
         if (hold_violations != 0) begin
@@ -552,7 +712,7 @@ module tb_basys3_top;
 
     // Watchdog
     initial begin
-        #(50_000_000);
+        #(100_000_000);
         $display("FAIL: timeout");
         $finish;
     end

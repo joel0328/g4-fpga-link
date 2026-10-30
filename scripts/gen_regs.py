@@ -44,6 +44,7 @@ def load(path=SRC):
     with open(path, "rb") as f:
         doc = tomllib.load(f)
     mp = doc["map"]
+    mp["const"] = doc.get("const", {})
     regs = doc["reg"]
     by_name = {}
     used = {}
@@ -114,9 +115,10 @@ def gen_vh(mp, regs):
         f"localparam [31:0] MAP_UNMAPPED   = 32'h{mp['unmapped']:08X};",
         f"localparam [6:0]  MAP_BURST_ADDR = 7'h{mp['burst_addr']:02X};",
         f"localparam integer MAP_BURST_MAX = {mp['burst_max']};",
-        "",
-        "// Register addresses",
     ]
+    for k, v in mp["const"].items():
+        out.append(f"localparam [31:0] {k} = 32'h{v:08X};")
+    out += ["", "// Register addresses"]
     w = max(len(r["name"]) for r in regs) + 4
     for r in regs:
         out.append(f"localparam [6:0] {('REG_' + r['name']).ljust(w)} = 7'h{r['addr']:02X};"
@@ -169,6 +171,8 @@ def gen_h(mp, regs):
         f"#define FPGA_BURST_ADDR      0x{mp['burst_addr']:02X}u",
         f"#define FPGA_BURST_MAX       {mp['burst_max']}u",
     ]
+    if mp["const"]:
+        out += [""] + [f"#define {('FPGA_' + k).ljust(20)} {c_const(v)}" for k, v in mp["const"].items()]
     for r in regs:
         fields = r.get("fields", [])
         if not fields:
@@ -189,8 +193,12 @@ def gen_h(mp, regs):
     return "\n".join(out) + "\n"
 
 
+def c_const(v):
+    return f"0x{v:08X}u" if v > 0xFFFF else f"{v}u"
+
+
 def c_comment(text):
-    return text.replace("*/", "* /").replace("µs", "us")
+    return text.replace("*/", "* /").replace("µs", "us").replace("–", "-")
 
 
 # ----------------------------------------------------------------- Python
@@ -204,9 +212,9 @@ def gen_py(mp, regs):
         f"BURST_ADDR = 0x{mp['burst_addr']:02X}",
         f"BURST_MAX = {mp['burst_max']}",
         f"CLK_HZ = {mp['clk_hz']}",
-        "",
-        "# Register addresses",
     ]
+    out += [f"{k} = 0x{v:08X}" if v > 0xFFFF else f"{k} = {v}" for k, v in mp["const"].items()]
+    out += ["", "# Register addresses"]
     for r in regs:
         out.append(f"REG_{r['name']} = 0x{r['addr']:02X}")
         if r["words"] > 1:
@@ -237,8 +245,9 @@ def gen_m(mp, regs):
         f"r.BURST_ADDR = {mp['burst_addr']};  % 0x{mp['burst_addr']:02X}",
         f"r.BURST_MAX = {mp['burst_max']};",
         f"r.CLK_HZ = {mp['clk_hz']};",
-        "",
     ]
+    out += [f"r.{k} = {v};" + (f"  % 0x{v:08X}" if v > 0xFFFF else "") for k, v in mp["const"].items()]
+    out.append("")
     for r in regs:
         out.append(f"r.REG.{r['name']} = {r['addr']};  % 0x{r['addr']:02X} {r['access']}")
         if r["words"] > 1:

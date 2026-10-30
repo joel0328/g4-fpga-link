@@ -10,6 +10,8 @@
 # fails while any generated file is stale. Bump [map].version on any incompatible
 # change; fpga_init refuses a mismatch.
 #
+# [const]: extra named constants, emitted as MAP-level values (C FPGA_<name>).
+#
 # Registers: name, addr, access (RO, RW, W, RW1C), desc (README text), optional
 # reset, words (a block of N consecutive words), fields.
 # Fields: name, bits ("n" or "msb:lsb"), optional desc. Each field becomes a C
@@ -19,12 +21,19 @@
 # shares another register's fields (documented, not emitted twice).
 
 [map]
-version    = 3
+version    = 4
 id         = 0x47344650       # "G4FP"
 unmapped   = 0xDEADBEEF       # read value of unmapped addresses
 burst_addr = 0x7F             # frame header escape for bursts, never a register
 burst_max  = 16               # words per burst frame
 clk_hz     = 100_000_000      # FPGA system clock
+
+[const]
+ARM_KEY         = 0x41524D21  # "ARM!": the only ARM write that arms
+WDT_TICKS_RESET = 3           # WDT_TICKS after reset
+LINK_FAULT_ERRS = 4           # rejected frames in a row (while armed) that latch FAULT.LINK
+ARM_SWITCH      = 15          # SW15 is the hardware arm enable
+SNAP_FAULT_LSB  = 8           # SNAP_SAFETY: FAULT_STATUS bits start here
 
 [[reg]]
 name   = "ID"
@@ -37,7 +46,7 @@ desc   = '0x47344650 ("G4FP")'
 name   = "VERSION"
 addr   = 0x01
 access = "RO"
-reset  = 3
+reset  = 4
 desc   = "{version}"
 
 [[reg]]
@@ -52,9 +61,9 @@ name   = "LEDS"
 addr   = 0x03
 access = "RW"
 reset  = 0
-desc   = "[15:0] LEDs; the pins stay off unless SAFETY.OUT_EN"
+desc   = "[13:0] user LEDs, lit only while armed. LED15 = armed and LED14 = fault are driven by the safety layer"
 fields = [
-    { name = "VALUE", bits = "15:0" },
+    { name = "VALUE", bits = "13:0" },
 ]
 
 [[reg]]
@@ -89,7 +98,7 @@ name   = "TICK_DIV"
 addr   = 0x06
 access = "RW"
 reset  = 0
-desc   = "LOOP_TICK period in 100 MHz clocks; 0 = off; 100000 = 1 kHz"
+desc   = "LOOP_TICK period in 100 MHz clocks; 0 = off; 100000 = 1 kHz. Writes ignored while armed"
 
 [[reg]]
 name   = "TICK_COUNT"
@@ -103,13 +112,13 @@ name   = "IRQ_STATUS"
 addr   = 0x08
 access = "RW1C"
 reset  = 0
-desc   = "[0] tick, [1] switch/button change, [2] CRC error, [3] watchdog fault"
+desc   = "[0] tick, [1] switch/button change, [2] CRC error, [3] fault latched (any cause)"
 field_prefix = "IRQ"
 fields = [
     { name = "TICK",    bits = "0" },
     { name = "INPUTS",  bits = "1" },
     { name = "CRC_ERR", bits = "2" },
-    { name = "WDOG",    bits = "3" },
+    { name = "FAULT",   bits = "3" },
 ]
 
 [[reg]]
@@ -151,29 +160,93 @@ fields = [
 ]
 
 [[reg]]
-name   = "WDOG"
-addr   = 0x0E
-access = "RW"
-reset  = 0
-desc   = "[23:0] watchdog timeout in µs; 0 = off (reset value). Every good frame restarts it"
-fields = [
-    { name = "TIMEOUT", bits = "23:0", c = "FPGA_WDOG_MAX_US" },
-]
-
-[[reg]]
-name   = "SAFETY"
-addr   = 0x0F
-access = "RW"
-reset  = 0
-desc   = "[0] OUT_EN (outputs enabled), [1] FAULT (latched on expiry; write 1 to clear)"
-fields = [
-    { name = "OUT_EN", bits = "0" },
-    { name = "FAULT",  bits = "1" },
-]
-
-[[reg]]
 name   = "SCRATCH_RAM"
 addr   = 0x10
 words  = 16
 access = "RW"
 desc   = "16 free words (burst self-test)"
+
+# ---- Safety layer (map v4). Every actuator output is forced off unless armed.
+
+[[reg]]
+name   = "ARM"
+addr   = 0x20
+access = "RW"
+reset  = 0
+desc   = "Write ARM_KEY (0x41524D21) to arm: needs SW15 up, no fault, tick running. Any other value disarms. Read: [0] armed, [1] SW15, [2] fault, [3] tick running"
+fields = [
+    { name = "ARMED",   bits = "0" },
+    { name = "SW_EN",   bits = "1" },
+    { name = "FAULT",   bits = "2" },
+    { name = "TICK_ON", bits = "3" },
+]
+
+[[reg]]
+name   = "WDT_TICKS"
+addr   = 0x21
+access = "RW"
+reset  = 3
+desc   = "[7:0] watchdog limit in loop ticks (1–255, 0 is stored as 1). A tick that finds this many ticks since the last kick latches FAULT.WDT. Writes ignored while armed"
+fields = [
+    { name = "VALUE", bits = "7:0" },
+]
+
+[[reg]]
+name   = "FAULT_STATUS"
+addr   = 0x22
+access = "RO"
+reset  = 0
+desc   = "Latched causes: [0] WDT missed kicks, [1] LINK 4 rejected frames in a row, [2] ESTOP btnD, [3] ARM_LOST SW15 down while armed. Any fault disarms and holds FAULT_N low"
+field_prefix = "FAULT"
+fields = [
+    { name = "WDT",      bits = "0" },
+    { name = "LINK",     bits = "1" },
+    { name = "ESTOP",    bits = "2" },
+    { name = "ARM_LOST", bits = "3" },
+]
+
+[[reg]]
+name   = "FAULT_CLEAR"
+addr   = 0x23
+access = "W"
+desc   = "Write 1s to clear FAULT_STATUS bits. ESTOP stays set while btnD is held"
+fields_from = "FAULT_STATUS"
+
+[[reg]]
+name   = "WDT_KICK"
+addr   = 0x24
+access = "RW"
+reset  = 0
+desc   = "Any write feeds the watchdog. Read: [7:0] ticks since the last kick (0 while disarmed)"
+
+# ---- Snapshot: latched at every LOOP_TICK, published between frames, so a
+# burst read of 0x30.. always returns one consistent sample.
+# 0x34-0x37 reserved for encoders (M3), 0x38-0x3F for the IMU (M5).
+
+[[reg]]
+name   = "SNAP_TICK"
+addr   = 0x30
+access = "RO"
+reset  = 0
+desc   = "TICK_COUNT of the snapshot (sequence number)"
+
+[[reg]]
+name   = "SNAP_TIME_US"
+addr   = 0x31
+access = "RO"
+reset  = 0
+desc   = "TIME_US at the tick"
+
+[[reg]]
+name   = "SNAP_INPUTS"
+addr   = 0x32
+access = "RO"
+reset  = 0
+desc   = "SWITCHES at the tick"
+
+[[reg]]
+name   = "SNAP_SAFETY"
+addr   = 0x33
+access = "RO"
+reset  = 0
+desc   = "ARM read bits in [3:0], FAULT_STATUS in [11:8], at the tick"
