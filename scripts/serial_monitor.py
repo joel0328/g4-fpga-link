@@ -132,8 +132,11 @@ def judge(lines):
                        f"only {len(ticks)} status line(s) seen; run longer"))
 
     if len(steps) >= 2:
-        a, b = steps[0], steps[-1]
-        rate = (int(b.group(1)) - int(a.group(1))) / (len(steps) - 1)
+        b = steps[-1]
+        # Median per-line rate, as for ticks: skip resets (btnC, or a stale
+        # line from before --reset took effect)
+        deltas = [int(y.group(1)) - int(x.group(1)) for x, y in zip(steps, steps[1:])]
+        rate = statistics.median([d for d in deltas if d >= 0] or [0])
         clean = int(b.group(2)) == 0 and int(b.group(3)) == 0 and 900 <= rate <= 1100
         checks.append(("Control step on every tick (SPI DMA)", clean,
                        f"{rate:.0f}/s, skipped {b.group(2)}, errors {b.group(3)}, "

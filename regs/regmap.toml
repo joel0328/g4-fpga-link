@@ -1,0 +1,179 @@
+# regmap.toml - the single source of the MCU <-> FPGA register map.
+#
+# scripts/gen_regs.py turns this into:
+#   rtl/fpga_regs.vh                          Verilog localparams (included by the RTL)
+#   firmware/FPGA_Link/Core/Inc/fpga_regs.h   C register map
+#   tools/fpga_regs.py, tools/fpga_regs.m     PC-side constants (Python, MATLAB)
+#   README.md                                 register table between the regmap markers
+#
+# After editing: `make regs`, then update the RTL logic and the tests. `make test`
+# fails while any generated file is stale. Bump [map].version on any incompatible
+# change; fpga_init refuses a mismatch.
+#
+# Registers: name, addr, access (RO, RW, W, RW1C), desc (README text), optional
+# reset, words (a block of N consecutive words), fields.
+# Fields: name, bits ("n" or "msb:lsb"), optional desc. Each field becomes a C
+# macro FPGA_<prefix>_<name>: (1u << n) for one bit, the in-place mask otherwise.
+# The prefix is the register name unless the register sets field_prefix ("" for
+# none); a field's own `c` key overrides the whole C name. fields_from = "REG"
+# shares another register's fields (documented, not emitted twice).
+
+[map]
+version    = 3
+id         = 0x47344650       # "G4FP"
+unmapped   = 0xDEADBEEF       # read value of unmapped addresses
+burst_addr = 0x7F             # frame header escape for bursts, never a register
+burst_max  = 16               # words per burst frame
+clk_hz     = 100_000_000      # FPGA system clock
+
+[[reg]]
+name   = "ID"
+addr   = 0x00
+access = "RO"
+reset  = 0x47344650
+desc   = '0x47344650 ("G4FP")'
+
+[[reg]]
+name   = "VERSION"
+addr   = 0x01
+access = "RO"
+reset  = 3
+desc   = "{version}"
+
+[[reg]]
+name   = "SCRATCH"
+addr   = 0x02
+access = "RW"
+reset  = 0
+desc   = "Link test register"
+
+[[reg]]
+name   = "LEDS"
+addr   = 0x03
+access = "RW"
+reset  = 0
+desc   = "[15:0] LEDs; the pins stay off unless SAFETY.OUT_EN"
+fields = [
+    { name = "VALUE", bits = "15:0" },
+]
+
+[[reg]]
+name   = "SWITCHES"
+addr   = 0x04
+access = "RO"
+desc   = "[15:0] switches, [20:16] buttons U, L, R, D, C (debounced)"
+field_prefix = ""
+fields = [
+    { name = "SW",    bits = "15:0", c = "FPGA_SW_MASK" },
+    { name = "BTN_U", bits = "16" },
+    { name = "BTN_L", bits = "17" },
+    { name = "BTN_R", bits = "18" },
+    { name = "BTN_D", bits = "19" },
+    { name = "BTN_C", bits = "20" },
+]
+
+[[reg]]
+name   = "SEG7"
+addr   = 0x05
+access = "RW"
+reset  = 0
+desc   = "[15:0] hex digits, [19:16] digit enables, [20] use register (else frame count)"
+fields = [
+    { name = "HEX",     bits = "15:0" },
+    { name = "DIGITS",  bits = "19:16", c = "FPGA_SEG7_ALL_DIGITS" },
+    { name = "USE_REG", bits = "20" },
+]
+
+[[reg]]
+name   = "TICK_DIV"
+addr   = 0x06
+access = "RW"
+reset  = 0
+desc   = "LOOP_TICK period in 100 MHz clocks; 0 = off; 100000 = 1 kHz"
+
+[[reg]]
+name   = "TICK_COUNT"
+addr   = 0x07
+access = "RO"
+reset  = 0
+desc   = "Ticks since reset"
+
+[[reg]]
+name   = "IRQ_STATUS"
+addr   = 0x08
+access = "RW1C"
+reset  = 0
+desc   = "[0] tick, [1] switch/button change, [2] CRC error, [3] watchdog fault"
+field_prefix = "IRQ"
+fields = [
+    { name = "TICK",    bits = "0" },
+    { name = "INPUTS",  bits = "1" },
+    { name = "CRC_ERR", bits = "2" },
+    { name = "WDOG",    bits = "3" },
+]
+
+[[reg]]
+name   = "IRQ_ENABLE"
+addr   = 0x09
+access = "RW"
+reset  = 0
+desc   = "Same bits; FPGA_IRQ = any enabled status bit"
+fields_from = "IRQ_STATUS"
+
+[[reg]]
+name   = "FRAMES_OK"
+addr   = 0x0A
+access = "RO"
+reset  = 0
+desc   = "Good frames"
+
+[[reg]]
+name   = "CRC_ERRS"
+addr   = 0x0B
+access = "RO"
+reset  = 0
+desc   = "Rejected frames"
+
+[[reg]]
+name   = "TIME_US"
+addr   = 0x0C
+access = "RO"
+reset  = 0
+desc   = "Free-running microsecond timestamp"
+
+[[reg]]
+name   = "CTRL"
+addr   = 0x0D
+access = "W"
+desc   = "[0] clear FRAMES_OK, CRC_ERRS and TICK_COUNT"
+fields = [
+    { name = "CLEAR_COUNTERS", bits = "0" },
+]
+
+[[reg]]
+name   = "WDOG"
+addr   = 0x0E
+access = "RW"
+reset  = 0
+desc   = "[23:0] watchdog timeout in µs; 0 = off (reset value). Every good frame restarts it"
+fields = [
+    { name = "TIMEOUT", bits = "23:0", c = "FPGA_WDOG_MAX_US" },
+]
+
+[[reg]]
+name   = "SAFETY"
+addr   = 0x0F
+access = "RW"
+reset  = 0
+desc   = "[0] OUT_EN (outputs enabled), [1] FAULT (latched on expiry; write 1 to clear)"
+fields = [
+    { name = "OUT_EN", bits = "0" },
+    { name = "FAULT",  bits = "1" },
+]
+
+[[reg]]
+name   = "SCRATCH_RAM"
+addr   = 0x10
+words  = 16
+access = "RW"
+desc   = "16 free words (burst self-test)"

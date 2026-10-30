@@ -13,7 +13,8 @@ file mkdir $out
 read_verilog [glob [file join $root rtl *.v]]
 read_xdc [file join $root constraints basys3_link.xdc]
 
-synth_design -top basys3_top -part $part
+# rtl/fpga_regs.vh (generated from regs/regmap.toml) is `included by the RTL
+synth_design -top basys3_top -part $part -include_dirs [file join $root rtl]
 opt_design
 place_design
 route_design

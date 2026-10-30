@@ -79,7 +79,8 @@ module spi_link (
     wire cs_start = (cs_s[2:1]  == 2'b10);
     assign cs_active = ~cs_s[1];
 
-    localparam [6:0] BURST_ADDR = 7'h7F;
+    `include "fpga_regs.vh"
+    localparam [6:0] BURST_ADDR = MAP_BURST_ADDR;   // frame header escape
 
     // Burst phases (after the 4 header bytes)
     localparam [1:0] PH_HDR  = 2'd0,
