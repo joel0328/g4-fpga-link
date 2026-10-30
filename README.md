@@ -16,10 +16,26 @@ and the scripts to bring it up, in one folder.
 3. **Check:** `python scripts/serial_monitor.py --reset` (needs `pip install pyserial`),
    or open the Nucleo's COM port at 115200 in any terminal and press reset.
 
-Expected: `Init: OK`, a clean 10,000-pass self-test, then one status line per
-second with ticks climbing ~1000/s and zero CRC errors. Basys LEDs follow the
-switches; btnC re-runs the self-test; the Nucleo's LD2 blinks slowly (fast =
-FPGA not found, solid = init error).
+Expected: `Init: OK`, clean single-frame and burst self-tests, then once a
+second a ticks line (~1000/s, zero CRC errors), a control-step line (one step
+per tick, none skipped) and `safety: outputs on, fault 0`. Basys LEDs follow
+the switches; btnC re-runs the self-tests and re-arms the safety layer; the
+Nucleo's LD2 blinks slowly (fast = FPGA not found, solid = init error).
+
+## Status
+
+Measured on hardware (Nucleo-G431KB + Basys 3, wired per the table below;
+Vivado 2025.1, STM32CubeProgrammer 2.22.0). Tags mark the gates.
+
+| Milestone | Result |
+|---|---|
+| **M1 link** (tag `m1-link`) | Bring-up passes at 5.3 and 10.6 MHz SPI. Self-test 10,000 write/readback pairs clean; 73.8k single register accesses/s at 10.6 MHz. 10-minute soak: 45.6M frames, 0 CRC errors. Vivado WNS 3.042 ns / WHS 0.119 ns. Switch/LED, btnC and all IRQ paths confirmed. `.ioc` regenerated in CubeMX 6.17 builds a byte-identical `.bin`. |
+| **Burst frames** (map v2) | 176.8k register words/s in 16-word bursts (2.4× single frames); 1.06M frames, 0 CRC errors. Testbench 388 checks; 4 injected RTL bugs all caught. |
+| **SPI DMA + 1 kHz control step** | The whole step (12-word burst read, 3-word burst write, IRQ clear) runs in interrupts: 74–89 µs from tick to done, ~17 µs CPU per step, no SPI in the main loop. 30-minute soak: 1.8M steps, 0 skipped, 0 errors. |
+| **Safety watchdog** (map v3, interim) | 5 ms watchdog fed by the control step. Freezing the MCU for 100 ms over SWD latched FAULT and cut the outputs; they stayed off after the MCU resumed until btnC re-armed. 30-minute soak armed: 1.8M steps, no false trips. Vivado WNS 2.033 ns. To be replaced by the full safety layer (arming, e-stop, fault causes). |
+
+CI (GitHub Actions) runs the RTL testbench, the driver↔RTL replay and the
+firmware build on every push.
 
 ## Wiring (Pmod JA ↔ Nucleo-32)
 
@@ -53,26 +69,37 @@ Makefile                    make test / make firmware
 driver↔RTL replay. On Windows, run it from Git Bash. CI runs it and the
 firmware build on every push.
 
-## Register map (version 2)
+## Register map (version 3)
 
 | Addr | Name | Access | Description |
 |---|---|---|---|
 | 0x00 | ID | RO | 0x47344650 ("G4FP") |
-| 0x01 | VERSION | RO | 2 |
+| 0x01 | VERSION | RO | 3 |
 | 0x02 | SCRATCH | RW | Link test register |
-| 0x03 | LEDS | RW | [15:0] LEDs |
+| 0x03 | LEDS | RW | [15:0] LEDs; the pins stay off unless SAFETY.OUT_EN |
 | 0x04 | SWITCHES | RO | [15:0] switches, [20:16] buttons U, L, R, D, C (debounced) |
 | 0x05 | SEG7 | RW | [15:0] hex digits, [19:16] digit enables, [20] use register (else frame count) |
 | 0x06 | TICK_DIV | RW | LOOP_TICK period in 100 MHz clocks; 0 = off; 100000 = 1 kHz |
 | 0x07 | TICK_COUNT | RO | Ticks since reset |
-| 0x08 | IRQ_STATUS | RW1C | [0] tick, [1] switch/button change, [2] CRC error |
+| 0x08 | IRQ_STATUS | RW1C | [0] tick, [1] switch/button change, [2] CRC error, [3] watchdog fault |
 | 0x09 | IRQ_ENABLE | RW | Same bits; FPGA_IRQ = any enabled status bit |
 | 0x0A | FRAMES_OK | RO | Good frames |
 | 0x0B | CRC_ERRS | RO | Rejected frames |
 | 0x0C | TIME_US | RO | Free-running microsecond timestamp |
 | 0x0D | CTRL | W | [0] clear FRAMES_OK, CRC_ERRS and TICK_COUNT |
+| 0x0E | WDOG | RW | [23:0] watchdog timeout in µs; 0 = off (reset value). Every good frame restarts it |
+| 0x0F | SAFETY | RW | [0] OUT_EN (outputs enabled), [1] FAULT (latched on expiry; write 1 to clear) |
 | 0x10–0x1F | SCRATCH_RAM | RW | 16 free words (burst self-test) |
 | 0x7F | — | — | Reserved: the burst escape in the frame header, never a register |
+
+## Safety watchdog
+
+With WDOG set, the FPGA expects a good frame at least every WDOG µs. If none
+arrives, it latches SAFETY.FAULT, clears OUT_EN (forcing the outputs off),
+raises IRQ bit 3 and holds FAULT_N low. Outputs stay off until the MCU writes
+SAFETY = 0x3 (clear FAULT and enable in one frame); OUT_EN alone is refused
+while FAULT is set. The demo firmware arms a 5 ms watchdog, fed by its 1 kHz
+control step; btnC re-runs the self-tests and re-arms.
 
 ## Protocol
 

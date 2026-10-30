@@ -1,6 +1,6 @@
 /*
  * fpga_regs.h - register map for the Basys 3 link bitstream.
- * Keep in sync with rtl/regfile.v (map version 2).
+ * Keep in sync with rtl/regfile.v (map version 3).
  */
 #ifndef FPGA_REGS_H
 #define FPGA_REGS_H
@@ -8,7 +8,7 @@
 #define FPGA_REG_ID          0x00u  /* RO   0x47344650 "G4FP"               */
 #define FPGA_REG_VERSION     0x01u  /* RO   register map version            */
 #define FPGA_REG_SCRATCH     0x02u  /* RW   free test register              */
-#define FPGA_REG_LEDS        0x03u  /* RW   [15:0] LEDs                     */
+#define FPGA_REG_LEDS        0x03u  /* RW   [15:0] LEDs (pins gated by SAFETY.OUT_EN) */
 #define FPGA_REG_SWITCHES    0x04u  /* RO   [15:0] switches, [20:16] buttons */
 #define FPGA_REG_SEG7        0x05u  /* RW   [15:0] hex, [19:16] digit en, [20] use_reg */
 #define FPGA_REG_TICK_DIV    0x06u  /* RW   LOOP_TICK period, 100 MHz clocks (0 = off) */
@@ -19,11 +19,13 @@
 #define FPGA_REG_CRC_ERRS    0x0Bu  /* RO   frames rejected for bad CRC     */
 #define FPGA_REG_TIME_US     0x0Cu  /* RO   free-running microseconds       */
 #define FPGA_REG_CTRL        0x0Du  /* W    [0] clear link/tick counters    */
+#define FPGA_REG_WDOG        0x0Eu  /* RW   [23:0] watchdog timeout, us (0 = off) */
+#define FPGA_REG_SAFETY      0x0Fu  /* RW   [0] OUT_EN, [1] FAULT (latched, W1C) */
 #define FPGA_REG_SCRATCH_RAM 0x10u  /* RW   16 words, 0x10-0x1F, for burst tests */
 #define FPGA_SCRATCH_RAM_WORDS 16u
 
 #define FPGA_ID_VALUE        0x47344650u
-#define FPGA_MAP_VERSION     2u
+#define FPGA_MAP_VERSION     3u
 #define FPGA_UNMAPPED_VALUE  0xDEADBEEFu
 
 /* Burst frames: header address 0x7F is the escape, never a register */
@@ -34,6 +36,7 @@
 #define FPGA_IRQ_TICK        (1u << 0)
 #define FPGA_IRQ_INPUTS      (1u << 1)
 #define FPGA_IRQ_CRC_ERR     (1u << 2)
+#define FPGA_IRQ_WDOG        (1u << 3)
 
 /* SEG7 fields */
 #define FPGA_SEG7_USE_REG    (1u << 20)
@@ -48,6 +51,12 @@
 #define FPGA_BTN_C           (1u << 20)
 
 #define FPGA_CTRL_CLEAR_COUNTERS (1u << 0)
+
+/* SAFETY bits. Write FPGA_SAFETY_FAULT | FPGA_SAFETY_OUT_EN to clear a
+ * watchdog fault and re-enable the outputs in one frame. */
+#define FPGA_SAFETY_OUT_EN   (1u << 0)
+#define FPGA_SAFETY_FAULT    (1u << 1)
+#define FPGA_WDOG_MAX_US     0x00FFFFFFu
 
 /* LOOP_TICK helpers (FPGA system clock is 100 MHz) */
 #define FPGA_CLK_HZ          100000000u

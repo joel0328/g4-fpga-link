@@ -17,6 +17,7 @@ Nucleo's reset button while this runs.
 import argparse
 import os
 import re
+import statistics
 import subprocess
 import sys
 import time
@@ -39,6 +40,7 @@ SELFTEST_RE = re.compile(r"^\s*(\S.*?): (\d+) iterations in (\d+) ms, mismatches
                          r"MCU CRC errors (\d+), FPGA CRC errors (\d+), SPI errors (\d+)")
 STEP_RE = re.compile(r"step: done (\d+), skipped (\d+), errors (\d+), latency (\d+)\.\.(\d+) ns "
                      r"\(avg (\d+)\), callback CPU avg (\d+) ns")
+SAFETY_RE = re.compile(r"safety: outputs (on|off), fault (\d+), wdog (\d+) us")
 
 
 def find_port():
@@ -92,6 +94,9 @@ def judge(lines):
     ticks = [m for m in ticks if m]
     steps = [STEP_RE.search(l) for l in lines]
     steps = [m for m in steps if m]
+    safety = [SAFETY_RE.search(l) for l in lines]
+    safety = [m for m in safety if m]
+    faults = [l.strip() for l in lines if l.startswith("SAFETY FAULT")]
 
     checks = []
     checks.append(("FPGA answered (ID + map version)", init_ok,
@@ -107,10 +112,14 @@ def judge(lines):
             checks.append((name, False, "no result line seen"))
 
     if len(ticks) >= 2:
-        a, b = ticks[0], ticks[-1]
-        n = len(ticks) - 1
-        mcu_rate = (int(b.group(1)) - int(a.group(1))) / n
-        fpga_rate = (int(b.group(2)) - int(a.group(2))) / n
+        b = ticks[-1]
+        # Per-line rates (lines are ~1 s apart). Skip intervals where a count
+        # went backwards: btnC clears both counters on purpose.
+        deltas = [(int(y.group(1)) - int(x.group(1)), int(y.group(2)) - int(x.group(2)))
+                  for x, y in zip(ticks, ticks[1:])]
+        deltas = [d for d in deltas if d[0] >= 0 and d[1] >= 0] or [(0, 0)]
+        mcu_rate = statistics.median(d[0] for d in deltas)
+        fpga_rate = statistics.median(d[1] for d in deltas)
         lo, hi = int(b.group(3)), int(b.group(4))
         ok_rate = 900 <= mcu_rate <= 1100 and abs(mcu_rate - fpga_rate) <= 5
         checks.append(("LOOP_TICK ~1 kHz, MCU and FPGA agree", ok_rate,
@@ -133,6 +142,15 @@ def judge(lines):
     else:
         checks.append(("Control step on every tick (SPI DMA)", False,
                        f"only {len(steps)} step line(s) seen"))
+
+    if safety:
+        m = safety[-1]
+        armed = m.group(1) == "on" and m.group(2) == "0" and int(m.group(3)) > 0
+        checks.append(("Safety armed, no watchdog fault", armed and not faults,
+                       f"outputs {m.group(1)}, fault {m.group(2)}, wdog {m.group(3)} us"
+                       + (f"; {len(faults)} SAFETY FAULT line(s)" if faults else "")))
+    else:
+        checks.append(("Safety armed, no watchdog fault", False, "no safety line seen"))
 
     print("\n--- Bring-up checks ---")
     for name, ok, detail in checks:

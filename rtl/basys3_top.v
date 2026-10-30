@@ -5,7 +5,8 @@
 //   JA1 SPI_SCK  in    JA7  FPGA_IRQ   out (active high)
 //   JA2 SPI_MOSI in    JA8  LOOP_TICK  out (1 us high pulse)
 //   JA3 SPI_MISO out   JA9  FPGA_RST_N in  (pulled up; MCU drives low to reset)
-//   JA4 SPI_CS_N in    JA10 FAULT_N    out (low while a CRC error is latched)
+//   JA4 SPI_CS_N in    JA10 FAULT_N    out (low ~0.1 s after a CRC error, and
+//                                         while the watchdog fault is latched)
 //
 // The 7-segment display shows the good-frame count until the MCU writes SEG7
 // with bit 20 set. LED behavior is entirely MCU-controlled through LEDS.
@@ -73,7 +74,7 @@ module basys3_top (
     wire        reg_we, frame_ok, crc_err, cs_active;
     wire [15:0] seg7_value;
     wire [3:0]  seg7_enable;
-    wire        tick_strobe, irq_int;
+    wire        tick_strobe, irq_int, safety_fault;
 
     spi_link u_spi (
         .clk(clk), .rst(rst),
@@ -91,7 +92,7 @@ module basys3_top (
         .switches(in_stable[15:0]), .buttons(in_stable[20:16]),
         .leds(led),
         .seg7_value(seg7_value), .seg7_enable(seg7_enable),
-        .loop_tick(tick_strobe), .irq(irq_int)
+        .loop_tick(tick_strobe), .irq(irq_int), .safety_fault(safety_fault)
     );
 
     // ------------------------------------------------------------------
@@ -107,14 +108,15 @@ module basys3_top (
 
     assign fpga_irq = irq_int;
 
-    // FAULT_N: low for ~0.1 s after any CRC error (visible on a scope or LED)
+    // FAULT_N: low for ~0.1 s after any CRC error (visible on a scope or LED),
+    // and held low while the watchdog fault is latched
     reg [23:0] fault_hold = 24'd0;
     always @(posedge clk) begin
         if (rst)          fault_hold <= 24'd0;
         else if (crc_err) fault_hold <= 24'd10_000_000;
         else if (fault_hold != 24'd0) fault_hold <= fault_hold - 24'd1;
     end
-    assign fault_n = (fault_hold == 24'd0);
+    assign fault_n = (fault_hold == 24'd0) && !safety_fault;
 
     // ------------------------------------------------------------------
     // 7-segment display: 4 hex digits, ~1 kHz per digit refresh

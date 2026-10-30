@@ -20,8 +20,13 @@
  *      interrupts over SPI DMA (see "Control step" below): LEDs follow the
  *      switches, the 7-segment display shows the tick count, pending FPGA
  *      IRQs are cleared. The main loop does no SPI; once a second it prints
- *      tick, link and control-step statistics.
- *      Press btnC on the Basys to re-run the self-tests.
+ *      tick, link, control-step and safety status.
+ *   4. Safety: the FPGA watchdog is armed with a 5 ms timeout (the step's
+ *      frames feed it every 1 ms) and the outputs are enabled. If the MCU
+ *      stops talking, the FPGA drops the outputs and latches FAULT; the app
+ *      reports it and leaves it latched.
+ *      Press btnC on the Basys to re-run the self-tests and re-arm (this
+ *      also clears a latched FAULT).
  */
 #include <stdio.h>
 #include "fpga_link.h"
@@ -30,6 +35,7 @@
 extern SPI_HandleTypeDef hspi1;
 
 #define BURST_TEST_ITERATIONS 2000u   /* 2 x 2000 frames, 32,000 words each way */
+#define WDOG_TIMEOUT_US       5000u   /* 5 control steps without a frame */
 
 static fpga_link_t fpga = {
     .hspi       = &hspi1,
@@ -53,12 +59,14 @@ bool fpga_app_link_up(void)
 
 /* ------------------------------------------------------------------------ */
 /* Control step: one per LOOP_TICK, all in interrupts over SPI DMA          */
-/*   tick ISR     -> burst read 0x04..0x0C (inputs, status, counters, time) */
+/*   tick ISR     -> burst read 0x04..0x0F (inputs, status, counters, time, */
+/*                   safety)                                               */
 /*   read done    -> burst write 0x03..0x05 (LEDS, SWITCHES = RO, SEG7)      */
 /*   write done   -> if an enabled IRQ is pending, W1C it (1-word burst)    */
 /* ------------------------------------------------------------------------ */
 enum { IN_SWITCHES, IN_SEG7, IN_TICK_DIV, IN_TICK_COUNT, IN_IRQ_STATUS,
-       IN_IRQ_ENABLE, IN_FRAMES_OK, IN_CRC_ERRS, IN_TIME_US, IN_N };
+       IN_IRQ_ENABLE, IN_FRAMES_OK, IN_CRC_ERRS, IN_TIME_US, IN_CTRL,
+       IN_WDOG, IN_SAFETY, IN_N };
 #define STEP_READ_ADDR   FPGA_REG_SWITCHES
 #define STEP_WRITE_ADDR  FPGA_REG_LEDS
 #define STEP_WRITE_N     3u   /* LEDS, SWITCHES (read-only: ignored), SEG7 */
@@ -216,6 +224,33 @@ static void dwt_enable(void)
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 }
 
+/* Restart the MCU's tick statistics. Call right after clearing the FPGA's
+ * TICK_COUNT so the two counts line up. */
+static void tick_stats_reset(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    tick_isr_count = 0;
+    tick_min_cyc = 0xFFFFFFFFu;
+    tick_max_cyc = 0;
+    __set_PRIMASK(primask);
+}
+
+/* Watchdog on, then outputs on (clearing any latched FAULT). The control step
+ * must be running, or about to, so the watchdog keeps getting frames. */
+static void safety_arm(void)
+{
+    fpga_write(&fpga, FPGA_REG_WDOG, WDOG_TIMEOUT_US);
+    fpga_write(&fpga, FPGA_REG_SAFETY, FPGA_SAFETY_FAULT | FPGA_SAFETY_OUT_EN);
+}
+
+/* Outputs off, then watchdog off: for deliberate pauses (self-tests) */
+static void safety_disarm(void)
+{
+    fpga_write(&fpga, FPGA_REG_SAFETY, 0);
+    fpga_write(&fpga, FPGA_REG_WDOG, 0);
+}
+
 /* ------------------------------------------------------------------------ */
 static void run_selftest(void)
 {
@@ -273,20 +308,20 @@ void fpga_app_init(void)
 
     run_selftest();
 
-    fpga_write(&fpga, FPGA_REG_IRQ_STATUS, 0x7);
-    fpga_write(&fpga, FPGA_REG_IRQ_ENABLE, FPGA_IRQ_INPUTS | FPGA_IRQ_CRC_ERR);
+    fpga_write(&fpga, FPGA_REG_IRQ_STATUS, 0xF);
+    fpga_write(&fpga, FPGA_REG_IRQ_ENABLE,
+               FPGA_IRQ_INPUTS | FPGA_IRQ_CRC_ERR | FPGA_IRQ_WDOG);
 
     /* Forget ticks that arrived from the previous run before fpga_init reset
      * the FPGA: they made the period max and the MCU/FPGA counts disagree.
      * The self-test cleared the FPGA's TICK_COUNT. */
-    __disable_irq();
-    tick_isr_count = 0;
-    tick_min_cyc = 0xFFFFFFFFu;
-    tick_max_cyc = 0;
-    __enable_irq();
+    tick_stats_reset();
     step_stats_reset();
 
-    /* 1 kHz loop tick, tick IRQ off (tick has its own line) */
+    /* Arm, then start the 1 kHz loop tick (tick IRQ off: it has its own
+     * line). The first step's frames arrive within 1 ms, well inside the
+     * watchdog timeout. */
+    safety_arm();
     fpga_write(&fpga, FPGA_REG_TICK_DIV, FPGA_TICK_DIV_FOR_HZ(1000));
     step_enabled = true;
 }
@@ -295,6 +330,7 @@ void fpga_app_poll(void)
 {
     static uint32_t last_print;
     static uint32_t last_btn;
+    static uint32_t last_fault;
     step_stats_t s;
 
     if (!link_up) {
@@ -308,14 +344,26 @@ void fpga_app_poll(void)
 
     step_snapshot(&s);
 
-    /* btnC: pause the control step and re-run the self-tests */
+    /* btnC: pause the control step, re-run the self-tests, re-arm */
     uint32_t btn_c = s.in[IN_SWITCHES] & FPGA_BTN_C;
     if (btn_c && !last_btn) {
         steps_pause();
+        safety_disarm();
         run_selftest();
+        fpga_write(&fpga, FPGA_REG_CTRL, FPGA_CTRL_CLEAR_COUNTERS);
+        tick_stats_reset();
+        safety_arm();
         step_enabled = true;
+        printf("safety: re-armed\r\n");
     }
     last_btn = btn_c;
+
+    /* A latched watchdog fault means the FPGA lost the MCU for > 5 ms.
+     * Report it once; leave it latched until btnC re-arms. */
+    uint32_t fault = s.in[IN_SAFETY] & FPGA_SAFETY_FAULT;
+    if (fault && !last_fault)
+        printf("SAFETY FAULT: watchdog expired, FPGA outputs off; press btnC to re-arm\r\n");
+    last_fault = fault;
 
     if (HAL_GetTick() - last_print >= 1000u) {
         last_print = HAL_GetTick();
@@ -339,5 +387,10 @@ void fpga_app_poll(void)
                    (unsigned long)(s.lat_max * 1000u / cyc_per_us),
                    (unsigned long)(s.lat_sum * 1000u / cyc_per_us / s.done),
                    (unsigned long)(s.cpu_sum * 1000u / cyc_per_us / s.done));
+
+        printf("safety: outputs %s, fault %lu, wdog %lu us\r\n",
+               (s.in[IN_SAFETY] & FPGA_SAFETY_OUT_EN) ? "on" : "off",
+               (unsigned long)((s.in[IN_SAFETY] & FPGA_SAFETY_FAULT) ? 1u : 0u),
+               (unsigned long)s.in[IN_WDOG]);
     }
 }

@@ -140,6 +140,16 @@ static void script(int checking)
     if (checking) EXPECT(st == FPGA_OK && rd[0] == FPGA_ID_VALUE && rd[1] == FPGA_MAP_VERSION,
                          "burst ID+VERSION: st=%d %08X %08X", st, rd[0], rd[1]);
 
+    /* 6b. Safety registers: off after reset; arming reads back */
+    st = fpga_read_burst(&l, FPGA_REG_WDOG, rd, 2);
+    if (checking) EXPECT(st == FPGA_OK && rd[0] == 0u && rd[1] == 0u,
+                         "WDOG/SAFETY after reset: st=%d %08X %08X", st, rd[0], rd[1]);
+    fpga_write(&l, FPGA_REG_WDOG, 5000u);
+    fpga_write(&l, FPGA_REG_SAFETY, FPGA_SAFETY_FAULT | FPGA_SAFETY_OUT_EN);
+    st = fpga_read_burst(&l, FPGA_REG_WDOG, rd, 2);
+    if (checking) EXPECT(st == FPGA_OK && rd[0] == 5000u && rd[1] == FPGA_SAFETY_OUT_EN,
+                         "WDOG/SAFETY armed: st=%d %08X %08X", st, rd[0], rd[1]);
+
     /* 7. Bad arguments are refused without sending a frame */
     st = fpga_read_burst(&l, FPGA_REG_SCRATCH_RAM, rd, 0);
     if (checking) EXPECT(st == FPGA_ERR_PARAM, "burst count 0: st=%d", st);

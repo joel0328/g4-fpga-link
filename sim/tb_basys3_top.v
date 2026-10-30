@@ -258,7 +258,7 @@ module tb_basys3_top;
             burst_read(7'h00, 2, 8'd1, 1'b0, ok);
             check("burst ID+VERSION (crc)", {31'h0, ok}, 32'h1);
             check("burst ID", br[0], 32'h4734_4650);
-            check("burst VERSION", br[1], 32'h0000_0002);
+            check("burst VERSION", br[1], 32'h0000_0003);
 
             // Addresses wrap: 0x7E, 0x7F, 0x00
             burst_read(7'h7E, 3, 8'd2, 1'b0, ok);
@@ -282,7 +282,7 @@ module tb_basys3_top;
             $display("SPI %.1f MHz, MISO delay %.0f ns", 1000.0 / (2.0 * hp), delay);
 
             read_expect("ID", 7'h00, 32'h4734_4650);
-            read_expect("VERSION", 7'h01, 32'h0000_0002);
+            read_expect("VERSION", 7'h01, 32'h0000_0003);
 
             // Scratch: walking patterns
             for (i = 0; i < 32; i = i + 1) begin
@@ -332,6 +332,10 @@ module tb_basys3_top;
         pulses = 0;
         $display("=== SPI link testbench ===");
         #(4000);   // past power-on reset
+
+        // Outputs (LED pins) stay off until SAFETY.OUT_EN; enable them for
+        // the link tests. The watchdog is off after reset.
+        reg_write(7'h0F, 32'h1, 1'b0);
 
         // Speeds: 5.3 MHz (prescaler /32), 10.6 MHz (/16), 12.5 MHz stress
         link_suite(94.0, 8.0);
@@ -409,6 +413,50 @@ module tb_basys3_top;
         reg_write(7'h02, 32'h5EED_5EED, 1'b0);
         read_expect("single write right after a burst", 7'h02, 32'h5EED_5EED);
 
+        // Safety watchdog
+        $display("Safety watchdog");
+        reg_write(7'h03, 32'h0000_00FF, 1'b0);
+        reg_write(7'h0F, 32'h0, 1'b0);
+        #20;
+        check("LED pins off with OUT_EN = 0", {16'h0, led}, 32'h0);
+        read_expect("LEDS still reads the commanded value", 7'h03, 32'h0000_00FF);
+        reg_write(7'h0F, 32'h1, 1'b0);
+        #20;
+        check("LED pins on with OUT_EN = 1", {16'h0, led}, 32'h0000_00FF);
+
+        reg_write(7'h08, 32'hF, 1'b0);            // clear all IRQs
+        reg_write(7'h09, 32'h8, 1'b0);            // watchdog IRQ only
+        reg_write(7'h0E, 32'd50, 1'b0);           // 50 us timeout
+        read_expect("WDOG", 7'h0E, 32'd50);
+        for (i = 0; i < 30; i = i + 1)            // ~170 us of traffic
+            reg_read(7'h0F, 1'b0, d, ok);
+        read_expect("SAFETY armed while frames keep coming", 7'h0F, 32'h1);
+        check("no watchdog IRQ while fed", {31'h0, irq}, 32'h0);
+
+        #(80_000);                                // silence: expires at 50 us
+        check("LED pins off after expiry", {16'h0, led}, 32'h0);
+        check("FAULT latched", {31'h0, dut.safety_fault}, 32'h1);
+        check("FAULT_N low while latched", {31'h0, fault_n}, 32'h0);
+        check("watchdog IRQ", {31'h0, irq}, 32'h1);
+        read_expect("SAFETY = FAULT, OUT_EN cleared", 7'h0F, 32'h2);
+
+        reg_write(7'h0F, 32'h1, 1'b0);            // OUT_EN alone is refused
+        read_expect("OUT_EN refused while FAULT", 7'h0F, 32'h2);
+        #20;
+        check("LED pins stay off", {16'h0, led}, 32'h0);
+
+        reg_write(7'h0F, 32'h3, 1'b0);            // clear FAULT and enable together
+        read_expect("SAFETY re-armed", 7'h0F, 32'h1);
+        #20;
+        check("FAULT cleared", {31'h0, dut.safety_fault}, 32'h0);
+        check("LED pins back on", {16'h0, led}, 32'h0000_00FF);
+
+        reg_write(7'h0E, 32'd0, 1'b0);            // timeout 0 = off
+        #(80_000);
+        read_expect("no trip with WDOG = 0", 7'h0F, 32'h1);
+        reg_write(7'h08, 32'h8, 1'b0);
+        reg_write(7'h09, 32'h0, 1'b0);
+
         // IRQ: CRC error bit (bit 2), enabled after the fact
         reg_write(7'h08, 32'h7, 1'b0);            // clear all
         reg_write(7'h09, 32'h4, 1'b0);            // enable CRC IRQ
@@ -481,6 +529,14 @@ module tb_basys3_top;
         #(500);
         read_expect("SCRATCH cleared by FPGA_RST_N", 7'h02, 32'h0);
         read_expect("LEDS cleared by FPGA_RST_N", 7'h03, 32'h0);
+        reg_write(7'h0E, 32'd50, 1'b0);
+        reg_write(7'h0F, 32'h1, 1'b0);
+        rst_n = 1'b0;
+        #(500);
+        rst_n = 1'b1;
+        #(500);
+        read_expect("WDOG off after FPGA_RST_N", 7'h0E, 32'h0);
+        read_expect("SAFETY off after FPGA_RST_N", 7'h0F, 32'h0);
 
         checks = checks + 1;
         if (hold_violations != 0) begin
