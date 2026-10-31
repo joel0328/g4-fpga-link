@@ -27,11 +27,19 @@
  *      clears faults, arms) or 'a' on the console. The FPGA also needs SW15
  *      up. A latched fault (missed kicks, link errors, btnD e-stop, SW15
  *      dropped) disarms in hardware; the app reports it and leaves it latched.
+ *   5. Motors (map v5): the step writes the motor duties with each watchdog
+ *      kick and reads both encoders with the snapshot. The duty comes only
+ *      from the console ('m'), and the app drops it to 0 whenever the FPGA
+ *      reports disarmed, so re-arming never restarts a motor. The FPGA clamps
+ *      it to DUTY_LIMIT (50 % after reset).
  *
  * Console (VCP, 115200): a = arm, d = disarm, c = clear faults,
- *                        k = stop/restart watchdog kicks (to test the watchdog)
+ *                        k = stop/restart watchdog kicks (to test the watchdog),
+ *                        m<percent> then Enter or space = M1 duty, -100..100
+ *                        (e.g. "m25 ", "m-40 "), s = stop both motors
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include "fpga_link.h"
 #include "fpga_link_app.h"
 
@@ -39,6 +47,11 @@ extern SPI_HandleTypeDef hspi1;
 extern UART_HandleTypeDef huart2;
 
 #define BURST_TEST_ITERATIONS 2000u   /* 2 x 2000 frames, 32,000 words each way */
+
+/* Encoder counts per output-shaft revolution, for the RPM estimate only.
+ * JGB37-520 12 V 178 RPM: usually 11 lines x4 x 1:56 gearbox = 2464, but
+ * sellers vary; measure by turning the shaft one revolution by hand. */
+#define ENC_COUNTS_PER_REV 2464
 
 static fpga_link_t fpga = {
     .hspi       = &hspi1,
@@ -62,19 +75,24 @@ bool fpga_app_link_up(void)
 
 /* ------------------------------------------------------------------------ */
 /* Control step: one per LOOP_TICK, all in interrupts over SPI DMA          */
-/*   tick ISR       -> burst read SNAP_* 0x30..0x33 (one coherent sample)   */
+/*   tick ISR       -> burst read SNAP_* 0x30..0x37 (one coherent sample,   */
+/*                     encoders included)                                   */
 /*   snapshot done  -> burst write 0x03..0x05 (LEDS, SWITCHES = RO, SEG7)   */
-/*   outputs done   -> write WDT_KICK (unless kicks are stopped with 'k')   */
-/*   kick done      -> burst read 0x07..0x0B (tick count, IRQs, link stats) */
+/*   outputs done   -> burst write 0x24..0x26: WDT_KICK, M1_DUTY, M2_DUTY   */
+/*                     (0x25..0x26 only while kicks are stopped with 'k')   */
+/*   kick done      -> burst read 0x25..0x28 (duties, limit, encoder errs)  */
+/*   motor done     -> burst read 0x07..0x0B (tick count, IRQs, link stats) */
 /*   status done    -> if an enabled IRQ is pending, W1C it                 */
 /* ------------------------------------------------------------------------ */
-enum { SNAP_TICK, SNAP_TIME_US, SNAP_INPUTS, SNAP_SAFETY, SNAP_N };
+enum { SNAP_TICK, SNAP_TIME_US, SNAP_INPUTS, SNAP_SAFETY,
+       SNAP_ENC1, SNAP_ENC1_DELTA, SNAP_ENC2, SNAP_ENC2_DELTA, SNAP_N };
 enum { ST_TICK_COUNT, ST_IRQ_STATUS, ST_IRQ_ENABLE, ST_FRAMES_OK, ST_CRC_ERRS, ST_N };
+enum { MOT_M1_DUTY, MOT_M2_DUTY, MOT_LIMIT, MOT_ENC_ERRS, MOT_N };
 #define STEP_STATUS_ADDR FPGA_REG_TICK_COUNT
 #define STEP_WRITE_ADDR  FPGA_REG_LEDS
 #define STEP_WRITE_N     3u   /* LEDS, SWITCHES (read-only: ignored), SEG7 */
 
-enum { STAGE_SNAP, STAGE_OUT, STAGE_KICK, STAGE_STATUS, STAGE_IRQ_CLEAR };
+enum { STAGE_SNAP, STAGE_OUT, STAGE_KICK, STAGE_MOTOR, STAGE_STATUS, STAGE_IRQ_CLEAR };
 
 typedef struct {
     uint32_t done, skipped, errors;
@@ -83,11 +101,15 @@ typedef struct {
     uint64_t cpu_sum;             /* cycles spent in our tick/DMA callbacks */
     uint32_t snap[SNAP_N];        /* last good snapshot */
     uint32_t status[ST_N];        /* last good status read */
+    uint32_t motor[MOT_N];        /* last good motor readback */
 } step_stats_t;
 
 static uint32_t step_snap[SNAP_N];
 static uint32_t step_status[ST_N];
 static uint32_t step_out[STEP_WRITE_N];
+static uint32_t step_kick_out[3];    /* WDT_KICK, M1_DUTY, M2_DUTY */
+static uint32_t step_motor[MOT_N];
+static volatile int16_t motor_cmd[2];   /* duty commands, +/-FPGA_DUTY_MAX */
 static uint32_t step_stage;
 static volatile bool step_enabled;   /* off during init and self-tests */
 static volatile bool step_active;    /* this step's frames are in flight */
@@ -144,19 +166,32 @@ static void step_next(fpga_link_t *l, fpga_status_t st)
             step_out[1] = 0;
             step_out[2] = FPGA_SEG7_USE_REG | FPGA_SEG7_ALL_DIGITS |
                           (step_snap[SNAP_TICK] & 0xFFFFu);
+            /* Disarmed: forget the duty, so arming never restarts a motor */
+            if (!(step_snap[SNAP_SAFETY] & FPGA_ARM_ARMED))
+                motor_cmd[0] = motor_cmd[1] = 0;
             step_stage = STAGE_OUT;
             more = true;
             r = fpga_write_burst_async(l, STEP_WRITE_ADDR, step_out, STEP_WRITE_N, step_next);
             break;
         case STAGE_OUT:
-            if (step_kick) {
-                step_stage = STAGE_KICK;
-                more = true;
-                r = fpga_write_burst_async(l, FPGA_REG_WDT_KICK, &v, 1, step_next);
-                break;
-            }
-            /* fall through */
+            step_kick_out[0] = 0;
+            step_kick_out[1] = (uint16_t)motor_cmd[0];
+            step_kick_out[2] = (uint16_t)motor_cmd[1];
+            step_stage = STAGE_KICK;
+            more = true;
+            if (step_kick)
+                r = fpga_write_burst_async(l, FPGA_REG_WDT_KICK, step_kick_out, 3, step_next);
+            else
+                r = fpga_write_burst_async(l, FPGA_REG_M1_DUTY, &step_kick_out[1], 2, step_next);
+            break;
         case STAGE_KICK:
+            step_stage = STAGE_MOTOR;
+            more = true;
+            r = fpga_read_burst_async(l, FPGA_REG_M1_DUTY, step_motor, MOT_N, step_next);
+            break;
+        case STAGE_MOTOR:
+            for (uint32_t i = 0; i < MOT_N; i++)
+                step_stats.motor[i] = step_motor[i];
             step_stage = STAGE_STATUS;
             more = true;
             r = fpga_read_burst_async(l, STEP_STATUS_ADDR, step_status, ST_N, step_next);
@@ -335,6 +370,28 @@ static void safety_cmd(char c)
     step_enabled = true;
 }
 
+/* "m<percent>": set M1's duty (main loop; the next step sends it) */
+static void motor_set(const char *arg, bool armed)
+{
+    long pct = strtol(arg, NULL, 10);
+
+    if (!armed) {
+        printf("motor: not armed; arm first (SW15 up, then 'a' or btnC)\r\n");
+        return;
+    }
+    if (pct > 100) pct = 100;
+    if (pct < -100) pct = -100;
+    motor_cmd[0] = (int16_t)(pct * (long)FPGA_DUTY_MAX / 100);
+    printf("motor: M1 %ld %% (duty %d); the FPGA clamps to DUTY_LIMIT\r\n",
+           pct, (int)motor_cmd[0]);
+}
+
+static void motor_stop(void)
+{
+    motor_cmd[0] = motor_cmd[1] = 0;
+    printf("motor: stopped\r\n");
+}
+
 /* One console byte, if any (polled; the VCP is otherwise only written) */
 static int console_getc(void)
 {
@@ -419,6 +476,7 @@ void fpga_app_init(void)
     fpga_write(&fpga, FPGA_REG_TICK_DIV, FPGA_TICK_DIV_FOR_HZ(1000));
     step_enabled = true;
     printf("safety: disarmed; SW15 up, then btnC or 'a' to arm\r\n");
+    printf("console: a arm, d disarm, c clear faults, k kicks, m<pct> M1 duty, s stop\r\n");
 }
 
 void fpga_app_poll(void)
@@ -426,6 +484,9 @@ void fpga_app_poll(void)
     static uint32_t last_print;
     static uint32_t last_btn;
     static uint32_t last_faults;
+    static uint32_t last_enc1, last_enc_tick;
+    static char mline[8];
+    static int mlen = -1;            /* >= 0 while reading "m<percent>" */
     step_stats_t s;
     int c;
 
@@ -438,11 +499,31 @@ void fpga_app_poll(void)
         return;
     }
 
-    if ((c = console_getc()) >= 0)
-        safety_cmd((char)c);
-
     step_snapshot(&s);
     uint32_t safety = s.snap[SNAP_SAFETY];
+
+    if ((c = console_getc()) >= 0) {
+        if (mlen >= 0) {
+            if (((c >= '0' && c <= '9') || (c == '-' && mlen == 0)) &&
+                mlen < (int)sizeof mline - 1) {
+                mline[mlen++] = (char)c;
+            } else {
+                mline[mlen] = '\0';
+                if ((c == '\r' || c == '\n' || c == ' ') && mlen > 0)
+                    motor_set(mline, (safety & FPGA_ARM_ARMED) != 0);
+                else
+                    printf("motor: usage m<percent> then Enter, e.g. m25 or m-40\r\n");
+                mlen = -1;
+            }
+        } else if (c == 'm') {
+            mlen = 0;
+        } else if (c == 's') {
+            motor_stop();
+        } else if (c != '\r' && c != '\n' && c != ' ') {
+            safety_cmd((char)c);
+        }
+    }
+
     uint32_t faults = (safety >> FPGA_SNAP_FAULT_LSB) & 0xFu;
 
     /* btnC: pause the control step, re-run the self-tests, clear faults, arm */
@@ -496,5 +577,21 @@ void fpga_app_poll(void)
                (safety & FPGA_ARM_SW_EN) ? "up" : "down",
                step_kick ? "on" : "off",
                (unsigned long)faults);
+
+        /* Speed from the encoder count change over the ticks since the last
+         * line (1 tick = 1 ms) */
+        int32_t enc1 = (int32_t)s.snap[SNAP_ENC1];
+        uint32_t dt = s.snap[SNAP_TICK] - last_enc_tick;
+        int32_t cps = dt ? (int32_t)((int64_t)(int32_t)(s.snap[SNAP_ENC1] - last_enc1) * 1000 / (int32_t)dt) : 0;
+        last_enc1 = s.snap[SNAP_ENC1];
+        last_enc_tick = s.snap[SNAP_TICK];
+        printf("motor: M1 duty %ld (FPGA %ld), limit %lu, enc1 %ld, %ld counts/s "
+               "(~%ld RPM at %d/rev), enc2 %ld, enc errs %lu/%lu\r\n",
+               (long)motor_cmd[0], (long)(int32_t)s.motor[MOT_M1_DUTY],
+               (unsigned long)s.motor[MOT_LIMIT], (long)enc1, (long)cps,
+               (long)(cps * 60 / ENC_COUNTS_PER_REV), ENC_COUNTS_PER_REV,
+               (long)(int32_t)s.snap[SNAP_ENC2],
+               (unsigned long)(s.motor[MOT_ENC_ERRS] & FPGA_ENC_ERRS_ENC1),
+               (unsigned long)(s.motor[MOT_ENC_ERRS] >> 16));
     }
 }

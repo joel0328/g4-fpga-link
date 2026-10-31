@@ -11,7 +11,7 @@
 # so they work without make; see README.md.
 
 BUILD := build
-RTL   := rtl/spi_link.v rtl/regfile.v rtl/basys3_top.v
+RTL   := rtl/spi_link.v rtl/regfile.v rtl/hbridge_pwm.v rtl/quad_decoder.v rtl/basys3_top.v
 FW    := firmware/FPGA_Link
 DRV   := $(FW)/Core/Src/fpga_link.c
 DRVH  := $(FW)/Core/Inc/fpga_link.h $(FW)/Core/Inc/fpga_regs.h

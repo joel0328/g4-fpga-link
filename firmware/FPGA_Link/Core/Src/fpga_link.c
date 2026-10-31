@@ -313,6 +313,32 @@ fpga_status_t fpga_modify(fpga_link_t *l, uint8_t addr,
 }
 
 /* ------------------------------------------------------------------------ */
+/* Motors (map v5)                                                          */
+/* ------------------------------------------------------------------------ */
+fpga_status_t fpga_motor_set(fpga_link_t *l, uint32_t motor, int16_t duty)
+{
+    if (motor < 1u || motor > 2u)
+        return FPGA_ERR_PARAM;
+    return fpga_write(l, (uint8_t)(FPGA_REG_M1_DUTY + motor - 1u), (uint16_t)duty);
+}
+
+fpga_status_t fpga_encoder_read(fpga_link_t *l, uint32_t enc,
+                                int32_t *count, int32_t *delta)
+{
+    uint32_t v[2];
+    fpga_status_t st;
+
+    if (enc < 1u || enc > 2u)
+        return FPGA_ERR_PARAM;
+    st = fpga_read_burst(l, (uint8_t)(FPGA_REG_SNAP_ENC1_COUNT + 2u * (enc - 1u)), v, 2);
+    if (st == FPGA_OK) {
+        if (count) *count = (int32_t)v[0];
+        if (delta) *delta = (int32_t)v[1];
+    }
+    return st;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Init, reset, self-test                                                   */
 /* ------------------------------------------------------------------------ */
 void fpga_reset(fpga_link_t *l)

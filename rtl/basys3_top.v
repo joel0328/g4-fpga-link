@@ -12,6 +12,12 @@
 // with bit 20 set. LED15 = armed, LED14 = fault (safety layer); LED13..0 come
 // from LEDS and are lit only while armed. SW15 is the hardware arm enable and
 // btnD the e-stop.
+//
+// Pmod JB (motors, map v5; TB6612FNG with PWMA/PWMB and STBY tied high):
+//   JB1 M1_IN1 out   JB7  ENC1_A in    The IN pins carry 20 kHz PWM, gated by
+//   JB2 M1_IN2 out   JB8  ENC1_B in    ARMED: both low (coast) when disarmed.
+//   JB3 M2_IN1 out   JB9  ENC2_A in    Encoders run from JB6/JB12 3.3 V,
+//   JB4 M2_IN2 out   JB10 ENC2_B in    never 5 V (these pins aren't 5 V tolerant).
 
 module basys3_top (
     input  wire        clk,        // 100 MHz
@@ -35,8 +41,19 @@ module basys3_top (
     output wire        fpga_irq,
     output wire        loop_tick,
     input  wire        fpga_rst_n,
-    output wire        fault_n
+    output wire        fault_n,
+
+    output wire        m1_in1,
+    output wire        m1_in2,
+    output wire        m2_in1,
+    output wire        m2_in2,
+    input  wire        enc1_a,
+    input  wire        enc1_b,
+    input  wire        enc2_a,
+    input  wire        enc2_b
 );
+
+    `include "fpga_regs.vh"
 
     // ------------------------------------------------------------------
     // Reset: power-on reset plus MCU-driven reset (synchronized)
@@ -76,7 +93,11 @@ module basys3_top (
     wire        reg_we, frame_ok, crc_err, cs_active;
     wire [15:0] seg7_value;
     wire [3:0]  seg7_enable;
-    wire        tick_strobe, irq_int, fault_any;
+    wire        tick_strobe, irq_int, fault_any, armed;
+    wire [15:0] m1_duty, m2_duty;
+    wire [14:0] duty_limit;
+    wire [31:0] enc1_count, enc2_count;
+    wire        enc1_err, enc2_err;
 
     spi_link u_spi (
         .clk(clk), .rst(rst),
@@ -94,7 +115,32 @@ module basys3_top (
         .switches(in_stable[15:0]), .buttons(in_stable[20:16]),
         .leds(led),
         .seg7_value(seg7_value), .seg7_enable(seg7_enable),
-        .loop_tick(tick_strobe), .irq(irq_int), .fault_any(fault_any)
+        .loop_tick(tick_strobe), .irq(irq_int), .fault_any(fault_any),
+        .armed(armed),
+        .m1_duty(m1_duty), .m2_duty(m2_duty), .duty_limit(duty_limit),
+        .enc1_count(enc1_count), .enc2_count(enc2_count),
+        .enc1_err(enc1_err), .enc2_err(enc2_err)
+    );
+
+    // ------------------------------------------------------------------
+    // Motors: PWM outputs gated by ARMED, quadrature encoder inputs
+    // ------------------------------------------------------------------
+    hbridge_pwm #(.PERIOD(MAP_CLK_HZ / PWM_HZ)) u_m1 (
+        .clk(clk), .rst(rst), .enable(armed),
+        .duty(m1_duty), .limit(duty_limit), .in1(m1_in1), .in2(m1_in2)
+    );
+    hbridge_pwm #(.PERIOD(MAP_CLK_HZ / PWM_HZ)) u_m2 (
+        .clk(clk), .rst(rst), .enable(armed),
+        .duty(m2_duty), .limit(duty_limit), .in1(m2_in1), .in2(m2_in2)
+    );
+
+    quad_decoder #(.FILTER(ENC_FILTER_CLKS)) u_enc1 (
+        .clk(clk), .rst(rst), .a_pin(enc1_a), .b_pin(enc1_b),
+        .count(enc1_count), .err(enc1_err)
+    );
+    quad_decoder #(.FILTER(ENC_FILTER_CLKS)) u_enc2 (
+        .clk(clk), .rst(rst), .a_pin(enc2_a), .b_pin(enc2_b),
+        .count(enc2_count), .err(enc2_err)
     );
 
     // ------------------------------------------------------------------

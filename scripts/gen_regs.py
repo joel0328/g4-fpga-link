@@ -115,6 +115,7 @@ def gen_vh(mp, regs):
         f"localparam [31:0] MAP_UNMAPPED   = 32'h{mp['unmapped']:08X};",
         f"localparam [6:0]  MAP_BURST_ADDR = 7'h{mp['burst_addr']:02X};",
         f"localparam integer MAP_BURST_MAX = {mp['burst_max']};",
+        f"localparam integer MAP_CLK_HZ    = {mp['clk_hz']};",
     ]
     for k, v in mp["const"].items():
         out.append(f"localparam [31:0] {k} = 32'h{v:08X};")
@@ -198,7 +199,8 @@ def c_const(v):
 
 
 def c_comment(text):
-    return text.replace("*/", "* /").replace("µs", "us").replace("–", "-")
+    return (text.replace("*/", "* /").replace("µs", "us").replace("–", "-")
+            .replace("−", "-").replace("±", "+/-"))
 
 
 # ----------------------------------------------------------------- Python

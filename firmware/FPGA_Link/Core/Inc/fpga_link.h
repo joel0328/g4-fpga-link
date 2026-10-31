@@ -122,6 +122,15 @@ void fpga_async_complete(fpga_link_t *link, bool spi_ok);
 fpga_status_t fpga_modify(fpga_link_t *link, uint8_t addr,
                           uint32_t clear_mask, uint32_t set_mask);
 
+/* Motors (map v5), blocking. motor/enc is 1 or 2. duty is +/-FPGA_DUTY_MAX
+ * (Q15); the FPGA ignores it while disarmed and clamps it to DUTY_LIMIT.
+ * fpga_encoder_read returns the last tick's snapshot: position and counts
+ * since the tick before (either pointer may be NULL). A control step should
+ * read the whole snapshot in one burst instead. */
+fpga_status_t fpga_motor_set(fpga_link_t *link, uint32_t motor, int16_t duty);
+fpga_status_t fpga_encoder_read(fpga_link_t *link, uint32_t enc,
+                                int32_t *count, int32_t *delta);
+
 /* Random write/readback stress on SCRATCH. Shows progress on the 7-seg. */
 fpga_status_t fpga_selftest(fpga_link_t *link, uint32_t iterations,
                             fpga_selftest_t *result);

@@ -22,6 +22,10 @@ module tb_basys3_top;
     reg  sck = 1'b0, mosi = 1'b0, cs_n = 1'b1, rst_n = 1'b1;
     wire miso_pin, irq, tick, fault_n;
 
+    // Motors (map v5): H-bridge IN pins out, quadrature encoders in
+    wire m1_in1, m1_in2, m2_in1, m2_in2;
+    reg  e1a = 1'b0, e1b = 1'b0, e2a = 1'b0, e2b = 1'b0;
+
     // Wiring + buffer delay seen by the master when sampling MISO
     real miso_delay_ns = 8.0;
     reg  miso_seen = 1'b0;   // MISO idles low (tx_shift resets to 0)
@@ -41,7 +45,9 @@ module tb_basys3_top;
         .btnC(btnC), .btnU(btnU), .btnL(btnL), .btnR(btnR), .btnD(btnD),
         .led(led), .seg(seg), .dp(dp), .an(an),
         .spi_sck(sck), .spi_mosi(mosi), .spi_miso(miso_pin), .spi_cs_n(cs_n),
-        .fpga_irq(irq), .loop_tick(tick), .fpga_rst_n(rst_n), .fault_n(fault_n)
+        .fpga_irq(irq), .loop_tick(tick), .fpga_rst_n(rst_n), .fault_n(fault_n),
+        .m1_in1(m1_in1), .m1_in2(m1_in2), .m2_in1(m2_in1), .m2_in2(m2_in2),
+        .enc1_a(e1a), .enc1_b(e1b), .enc2_a(e2a), .enc2_b(e2b)
     );
 
     // ------------------------------------------------------------------
@@ -258,7 +264,7 @@ module tb_basys3_top;
             burst_read(7'h00, 2, 8'd1, 1'b0, ok);
             check("burst ID+VERSION (crc)", {31'h0, ok}, 32'h1);
             check("burst ID", br[0], 32'h4734_4650);
-            check("burst VERSION", br[1], 32'h0000_0004);
+            check("burst VERSION", br[1], 32'h0000_0005);
 
             // Addresses wrap: 0x7E, 0x7F, 0x00
             burst_read(7'h7E, 3, 8'd2, 1'b0, ok);
@@ -282,7 +288,7 @@ module tb_basys3_top;
             $display("SPI %.1f MHz, MISO delay %.0f ns", 1000.0 / (2.0 * hp), delay);
 
             read_expect("ID", 7'h00, 32'h4734_4650);
-            read_expect("VERSION", 7'h01, 32'h0000_0004);
+            read_expect("VERSION", 7'h01, 32'h0000_0005);
 
             // Scratch: walking patterns
             for (i = 0; i < 32; i = i + 1) begin
@@ -346,6 +352,75 @@ module tb_basys3_top;
     endtask
 
     // ------------------------------------------------------------------
+    // Motor helpers (map v5)
+    // ------------------------------------------------------------------
+    // Clocks each IN pin is high over 10 PWM periods (50,000 clocks), after
+    // two periods for a new duty to take effect. A whole number of periods
+    // gives an exact count, wherever the window starts.
+    integer h11, h12, h21, h22;
+    task pwm_measure;
+        integer k;
+        begin
+            #(100_000);
+            h11 = 0; h12 = 0; h21 = 0; h22 = 0;
+            for (k = 0; k < 50_000; k = k + 1) begin
+                @(posedge clk);
+                h11 = h11 + m1_in1;
+                h12 = h12 + m1_in2;
+                h21 = h21 + m2_in1;
+                h22 = h22 + m2_in2;
+            end
+        end
+    endtask
+
+    task pwm_expect(input [255:0] what, input integer e11, input integer e12,
+                    input integer e21, input integer e22);
+        begin
+            reg_write(7'h24, 32'h0, 1'b0);   // kick: a measurement spans 0.6 ms
+            pwm_measure;
+            check({what, ": M1 IN1"}, h11, e11);
+            check({what, ": M1 IN2"}, h12, e12);
+            check({what, ": M2 IN1"}, h21, e21);
+            check({what, ": M2 IN2"}, h22, e22);
+        end
+    endtask
+
+    // Encoder model: {A,B} steps 00 -> 10 -> 11 -> 01 count up (A leads B)
+    integer ph1 = 0, ph2 = 0;
+    function [1:0] quad_ab(input integer ph);
+        case (ph & 3)
+            0: quad_ab = 2'b00;
+            1: quad_ab = 2'b10;
+            2: quad_ab = 2'b11;
+            default: quad_ab = 2'b01;
+        endcase
+    endfunction
+
+    task enc_move(input integer which, input integer n);   // n signed, 2 us per step
+        integer k;
+        begin
+            for (k = 0; k < (n < 0 ? -n : n); k = k + 1) begin
+                if (which == 1) begin
+                    ph1 = ph1 + (n < 0 ? -1 : 1);
+                    {e1a, e1b} = quad_ab(ph1);
+                end else begin
+                    ph2 = ph2 + (n < 0 ? -1 : 1);
+                    {e2a, e2b} = quad_ab(ph2);
+                end
+                #(2000);
+            end
+        end
+    endtask
+
+    task snap8;   // snapshot incl. encoders into br[0..7]
+        reg ok;
+        begin
+            burst_read(7'h30, 8, 8'd7, 1'b0, ok);
+            check("snapshot x8 burst (crc)", {31'h0, ok}, 32'h1);
+        end
+    endtask
+
+    // ------------------------------------------------------------------
     // Main sequence
     // ------------------------------------------------------------------
     reg [31:0] d, prev_cnt, t0, t1;
@@ -365,6 +440,18 @@ module tb_basys3_top;
     always @(posedge clk)
         if (dut.u_regs.armed && dut.fault_any)
             armed_with_fault = armed_with_fault + 1;
+
+    // Motor invariants on every clock: no IN pin high unless armed, and never
+    // both pins of one bridge (that would be brake, not a commanded state)
+    integer motor_unarmed = 0, motor_both = 0;
+    reg [31:0] enc1_at_tick = 32'h0;
+    always @(posedge tick) enc1_at_tick = dut.enc1_count;
+    always @(posedge clk) begin
+        if ((m1_in1 || m1_in2 || m2_in1 || m2_in2) && !dut.u_regs.armed)
+            motor_unarmed = motor_unarmed + 1;
+        if ((m1_in1 && m1_in2) || (m2_in1 && m2_in2))
+            motor_both = motor_both + 1;
+    end
 
     initial begin
         pulses = 0;
@@ -607,6 +694,129 @@ module tb_basys3_top;
         check("next snapshot 20 us later", s_c[1] - s_a[1], 32'd20);
         reg_write(7'h06, 32'd0, 1'b0);
 
+        // Motors (map v5). PWM period 5000 clocks: a duty d gives
+        // floor(min(|d|, limit) * 5000 / 32768) clocks on per period.
+        $display("Motors and encoders");
+        reg_write(7'h06, 32'd100_000, 1'b0);              // 1 ms tick, disarmed
+        read_expect("DUTY_LIMIT reset = 50 %", 7'h27, 32'd16384);
+        read_expect("M1_DUTY reset", 7'h25, 32'h0);
+        read_expect("ENC_ERRS reset", 7'h28, 32'h0);
+        reg_write(7'h25, 32'h0000_4000, 1'b0);
+        reg_write(7'h26, 32'h0000_4000, 1'b0);
+        read_expect("M1_DUTY write ignored while disarmed", 7'h25, 32'h0);
+        read_expect("M2_DUTY write ignored while disarmed", 7'h26, 32'h0);
+        reg_write(7'h27, 32'd32767, 1'b0);
+        read_expect("DUTY_LIMIT writable while disarmed", 7'h27, 32'd32767);
+        pwm_expect("disarmed: pins idle", 0, 0, 0, 0);
+
+        arm;
+        pwm_expect("arming doesn't start a motor", 0, 0, 0, 0);
+        reg_write(7'h27, 32'd1000, 1'b0);
+        read_expect("DUTY_LIMIT locked while armed", 7'h27, 32'd32767);
+
+        // One burst: kick + M1 50 % forward + M2 25 % reverse
+        bw[0] = 32'h0;
+        bw[1] = 32'h0000_4000;
+        bw[2] = 32'hFFFF_E000;                            // -8192
+        burst_write(7'h24, 3, 8'd2, 1'b0, 1'b0, 0);
+        pwm_expect("M1 +50 %, M2 -25 %", 25_000, 0, 0, 12_500);
+        read_expect("M1_DUTY", 7'h25, 32'h0000_4000);
+        read_expect("M2_DUTY reads sign-extended", 7'h26, 32'hFFFF_E000);
+
+        reg_write(7'h25, 32'h0000_7FFF, 1'b0);
+        reg_write(7'h26, 32'h0000_8000, 1'b0);            // -32768 acts as -32767
+        pwm_expect("full scale both ways", 49_990, 0, 0, 49_990);
+        reg_write(7'h25, 32'hFFFF_C000, 1'b0);            // reverse M1 while running
+        pwm_expect("M1 reversed", 0, 25_000, 0, 49_990);
+        reg_write(7'h25, 32'h0000_0001, 1'b0);            // under one clock: off
+        pwm_expect("tiny duty", 0, 0, 0, 49_990);
+
+        // A fault turns the pins off on the same clock and zeroes the duties.
+        // Both motors run (IN1 and IN2 busy) when it hits, part way through
+        // a PWM period: the per-clock monitor checks the rest of that period.
+        reg_write(7'h25, 32'h0000_7FFF, 1'b0);
+        pwm_expect("running before the fault", 49_990, 0, 0, 49_990);
+        for (i = 0; i < 4; i = i + 1)
+            reg_write(7'h02, 32'h0, 1'b1);
+        check("motor pins off at the fault", {28'h0, m1_in1, m1_in2, m2_in1, m2_in2}, 32'h0);
+        read_expect("FAULT_STATUS = LINK (motor test)", 7'h22, 32'h2);
+        #(60_000);                                        // past the period end
+        check("motor pins off after the fault", {28'h0, m1_in1, m1_in2, m2_in1, m2_in2}, 32'h0);
+        read_expect("M1_DUTY zeroed by the fault", 7'h25, 32'h0);
+        read_expect("M2_DUTY zeroed by the fault", 7'h26, 32'h0);
+        reg_write(7'h23, 32'hF, 1'b0);
+        reg_write(7'h27, 32'd6554, 1'b0);                 // 20 %
+        arm;
+        pwm_expect("re-arming after a fault doesn't restart", 0, 0, 0, 0);
+        bw[0] = 32'h0;
+        bw[1] = 32'h0000_7FFF;
+        bw[2] = 32'hFFFF_8001;                            // -32767
+        burst_write(7'h24, 3, 8'd2, 1'b0, 1'b0, 0);
+        pwm_expect("clamped to DUTY_LIMIT 20 %", 10_000, 0, 0, 10_000);
+        read_expect("M1_DUTY keeps the commanded value", 7'h25, 32'h0000_7FFF);
+        reg_write(7'h20, 32'h0, 1'b0);                    // commanded disarm
+        check("motor pins off at disarm", {28'h0, m1_in1, m1_in2, m2_in1, m2_in2}, 32'h0);
+        read_expect("M1_DUTY zeroed by disarm", 7'h25, 32'h0);
+        reg_write(7'h27, 32'd16384, 1'b0);
+
+        // Encoders (the snapshot only needs the tick, not arming)
+        @(posedge tick);
+        #(1000);
+        enc_move(1, 100);                                 // 200 us
+        enc_move(2, -37);
+        @(posedge tick);
+        #(2000);
+        snap8;
+        check("ENC1 count", br[4], 32'd100);
+        check("ENC1 delta", br[5], 32'd100);
+        check("ENC2 count", br[6], -32'sd37);
+        check("ENC2 delta", br[7], -32'sd37);
+        @(posedge tick);
+        #(2000);
+        snap8;
+        check("ENC1 count holds", br[4], 32'd100);
+        check("ENC1 delta 0 when still", br[5], 32'd0);
+        check("ENC2 delta 0 when still", br[7], 32'd0);
+        enc_move(1, -150);                                // back through zero
+        @(posedge tick);
+        #(2000);
+        snap8;
+        check("ENC1 count after reversing", br[4], -32'sd50);
+        check("ENC1 delta after reversing", br[5], -32'sd150);
+
+        // Glitches shorter than the filter (64 clocks) don't count
+        e1a = ~e1a; #(300); e1a = ~e1a; #(300);
+        e2b = ~e2b; #(500); e2b = ~e2b; #(2000);
+        check("glitch: ENC1 count", dut.enc1_count, -32'sd50);
+        check("glitch: ENC2 count", dut.enc2_count, -32'sd37);
+        read_expect("glitches are not errors", 7'h28, 32'h0);
+
+        // A and B changing together is an error, not a step
+        {e1a, e1b} = ~{e1a, e1b}; ph1 = ph1 + 2; #(2000);
+        read_expect("ENC_ERRS: encoder 1", 7'h28, 32'h0000_0001);
+        {e2a, e2b} = ~{e2a, e2b}; ph2 = ph2 + 2; #(2000);
+        read_expect("ENC_ERRS: both", 7'h28, 32'h0001_0001);
+        check("illegal step doesn't count", dut.enc1_count, -32'sd50);
+        enc_move(1, 3);
+        check("counting resumes after an error", dut.enc1_count, -32'sd47);
+        reg_write(7'h0D, 32'h1, 1'b0);
+        read_expect("CTRL[0] clears ENC_ERRS", 7'h28, 32'h0);
+
+        // Snapshot holds the encoder at the tick, not at publication: 100 us
+        // ticks; a 16-word burst from T+90 spans the tick at T+100 while
+        // encoder 1 turns until T+150; the snapshot is published at CS rise
+        reg_write(7'h06, 32'd10_000, 1'b0);
+        @(posedge tick);
+        #(90_000);
+        fork
+            burst_read(7'h30, 16, 8'd15, 1'b0, ok);
+            enc_move(1, 30);
+        join
+        snap8;
+        check("ENC1 snapshot = count at the tick", br[4], enc1_at_tick);
+        check("encoder moved after the tick", {31'h0, dut.enc1_count != enc1_at_tick}, 32'h1);
+        reg_write(7'h06, 32'd0, 1'b0);
+
         // IRQ: CRC error bit (bit 2), enabled after the fact
         reg_write(7'h08, 32'h7, 1'b0);            // clear all
         reg_write(7'h09, 32'h4, 1'b0);            // enable CRC IRQ
@@ -695,8 +905,12 @@ module tb_basys3_top;
         read_expect("FAULT_STATUS cleared by FPGA_RST_N", 7'h22, 32'h0);
         read_expect("WDT_TICKS back to 3", 7'h21, 32'd3);
         read_expect("v3 WDOG address now unmapped", 7'h0E, 32'hDEAD_BEEF);
+        read_expect("DUTY_LIMIT back to 50 %", 7'h27, 32'd16384);
+        check("encoder count cleared by FPGA_RST_N", dut.enc1_count, 32'h0);
 
         check("never armed while a fault is latched (clocks)", armed_with_fault, 32'd0);
+        check("no motor pin high while disarmed (clocks)", motor_unarmed, 32'd0);
+        check("never both IN pins of a bridge (clocks)", motor_both, 32'd0);
 
         checks = checks + 1;
         if (hold_violations != 0) begin

@@ -13,6 +13,11 @@
 //   latched until FAULT_CLEAR (ESTOP only once btnD is released).
 // - TICK_DIV and WDT_TICKS can't change while armed, so the watchdog's time
 //   base can't be stopped from software.
+// - Motors (map v5): M1_DUTY/M2_DUTY feed the hbridge_pwm channels in the top,
+//   which are gated by ARMED. The duties are held at 0 while disarmed (writes
+//   ignored), so arming never starts a motor; DUTY_LIMIT is locked while armed.
+//   Encoder counts come from quad_decoder; the snapshot adds position and
+//   counts since the previous tick for each, and ENC_ERRS counts illegal steps.
 // - LED pins: [13:0] = LEDS while armed, else off; LED14 = fault, LED15 = armed.
 // - Snapshot (SNAP_*): captured on every LOOP_TICK, published once CS is
 //   idle, so a burst read never mixes two ticks.
@@ -42,17 +47,30 @@ module regfile (
 
     output reg         loop_tick,
     output wire        irq,
-    output wire        fault_any     // any fault latched
+    output wire        fault_any,    // any fault latched
+    output reg         armed = 1'b0, // gates every actuator output
+
+    // Motors (map v5)
+    output reg  [15:0] m1_duty = 16'h0,      // signed, 0 while disarmed
+    output reg  [15:0] m2_duty = 16'h0,
+    output reg  [14:0] duty_limit,           // largest |duty|
+    input  wire [31:0] enc1_count,
+    input  wire [31:0] enc2_count,
+    input  wire        enc1_err,             // one-clock strobes
+    input  wire        enc2_err
 );
 
     `include "fpga_regs.vh"
 
     localparam FW = FAULT_STATUS_W;
 
+    initial duty_limit = DUTY_LIMIT_RESET[14:0];
+
     reg [31:0] scratch    = 32'h0;
     reg [LEDS_W-1:0] leds_reg = {LEDS_W{1'b0}};
     reg [20:0] seg7_reg   = 21'h0;
     reg [31:0] tick_div   = 32'h0;
+    reg [31:0] tick_last  = 32'hFFFF_FFFF;   // tick_div - 1, kept off the compare path
     reg [31:0] tick_cnt   = 32'h0;
     reg [31:0] tick_count = 32'h0;
     reg [IRQ_STATUS_W-1:0] irq_status = {IRQ_STATUS_W{1'b0}};
@@ -65,7 +83,6 @@ module regfile (
     reg [31:0] sram [0:REG_SCRATCH_RAM_WORDS-1];   // not reset
 
     // Safety layer
-    reg          armed     = 1'b0;
     reg [FW-1:0] fault_st  = {FW{1'b0}};
     reg [7:0]    wdt_ticks = WDT_TICKS_RESET[7:0];
     reg [7:0]    wdt_cnt   = 8'd0;   // ticks since the last kick (saturates)
@@ -75,6 +92,11 @@ module regfile (
     reg [31:0] snap_tick = 32'h0, snap_time = 32'h0, snap_inputs = 32'h0, snap_safety = 32'h0;
     reg [31:0] stg_tick  = 32'h0, stg_time  = 32'h0, stg_inputs  = 32'h0, stg_safety  = 32'h0;
     reg        snap_pend = 1'b0;
+    reg [31:0] snap_enc1 = 32'h0, snap_d1 = 32'h0, snap_enc2 = 32'h0, snap_d2 = 32'h0;
+    reg [31:0] stg_enc1  = 32'h0, stg_d1  = 32'h0, stg_enc2  = 32'h0, stg_d2  = 32'h0;
+    reg [31:0] enc1_last = 32'h0, enc2_last = 32'h0;   // counts at the previous tick
+
+    reg [15:0] enc1_errs = 16'h0, enc2_errs = 16'h0;
 
     wire [20:0] inputs_now = {buttons, switches};
     wire [6:0]  sram_off   = addr - REG_SCRATCH_RAM;
@@ -84,7 +106,7 @@ module regfile (
     integer k;
     initial for (k = 0; k < REG_SCRATCH_RAM_WORDS; k = k + 1) sram[k] = 32'h0;   // configuration value
     wire tick_on   = (tick_div >= 32'd100);
-    wire tick_fire = tick_on && (tick_cnt >= tick_div - 32'd1);
+    wire tick_fire = tick_on && (tick_cnt >= tick_last);
     wire us_tick   = (us_div == 7'd99);
 
     assign seg7_value  = seg7_reg[SEG7_USE_REG] ? seg7_reg[SEG7_HEX_MSB:SEG7_HEX_LSB] : frames_ok[15:0];
@@ -146,10 +168,18 @@ module regfile (
             REG_FAULT_STATUS: rdata = {{(32-FW){1'b0}}, fault_st};
             REG_FAULT_CLEAR:  rdata = 32'h0;
             REG_WDT_KICK:     rdata = {24'h0, wdt_cnt};
+            REG_M1_DUTY:      rdata = {{16{m1_duty[15]}}, m1_duty};
+            REG_M2_DUTY:      rdata = {{16{m2_duty[15]}}, m2_duty};
+            REG_DUTY_LIMIT:   rdata = {17'h0, duty_limit};
+            REG_ENC_ERRS:     rdata = {enc2_errs, enc1_errs};
             REG_SNAP_TICK:    rdata = snap_tick;
             REG_SNAP_TIME_US: rdata = snap_time;
             REG_SNAP_INPUTS:  rdata = snap_inputs;
             REG_SNAP_SAFETY:  rdata = snap_safety;
+            REG_SNAP_ENC1_COUNT: rdata = snap_enc1;
+            REG_SNAP_ENC1_DELTA: rdata = snap_d1;
+            REG_SNAP_ENC2_COUNT: rdata = snap_enc2;
+            REG_SNAP_ENC2_DELTA: rdata = snap_d2;
             default:          rdata = MAP_UNMAPPED;
         endcase
     end
@@ -162,6 +192,7 @@ module regfile (
             leds_reg   <= {LEDS_W{1'b0}};
             seg7_reg   <= 21'h0;
             tick_div   <= 32'h0;
+            tick_last  <= 32'hFFFF_FFFF;
             tick_cnt   <= 32'h0;
             tick_count <= 32'h0;
             irq_status <= {IRQ_STATUS_W{1'b0}};
@@ -181,6 +212,17 @@ module regfile (
             snap_inputs <= 32'h0;
             snap_safety <= 32'h0;
             snap_pend  <= 1'b0;
+            snap_enc1  <= 32'h0;
+            snap_d1    <= 32'h0;
+            snap_enc2  <= 32'h0;
+            snap_d2    <= 32'h0;
+            enc1_last  <= 32'h0;   // the decoders reset with us
+            enc2_last  <= 32'h0;
+            m1_duty    <= 16'h0;
+            m2_duty    <= 16'h0;
+            duty_limit <= DUTY_LIMIT_RESET[14:0];
+            enc1_errs  <= 16'h0;
+            enc2_errs  <= 16'h0;
         end else begin
             // Microsecond timestamp
             if (us_tick) begin
@@ -211,14 +253,28 @@ module regfile (
                 stg_inputs  <= {11'h0, inputs_now};
                 stg_safety  <= {{(32-SNAP_FAULT_LSB-FW){1'b0}}, fault_st,
                                 {(SNAP_FAULT_LSB-4){1'b0}}, arm_rd[3:0]};
+                stg_enc1    <= enc1_count;
+                stg_d1      <= enc1_count - enc1_last;
+                stg_enc2    <= enc2_count;
+                stg_d2      <= enc2_count - enc2_last;
+                enc1_last   <= enc1_count;
+                enc2_last   <= enc2_count;
                 snap_pend   <= 1'b1;
             end else if (snap_pend && !cs_active) begin
                 snap_tick   <= stg_tick;
                 snap_time   <= stg_time;
                 snap_inputs <= stg_inputs;
                 snap_safety <= stg_safety;
+                snap_enc1   <= stg_enc1;
+                snap_d1     <= stg_d1;
+                snap_enc2   <= stg_enc2;
+                snap_d2     <= stg_d2;
                 snap_pend   <= 1'b0;
             end
+
+            // Encoder error counters (wrap)
+            if (enc1_err) enc1_errs <= enc1_errs + 16'd1;
+            if (enc2_err) enc2_errs <= enc2_errs + 16'd1;
 
             // Input change detection
             inputs_q <= inputs_now;
@@ -261,18 +317,33 @@ module regfile (
                     REG_SCRATCH:    scratch  <= wdata;
                     REG_LEDS:       leds_reg <= wdata[LEDS_VALUE_MSB:LEDS_VALUE_LSB];
                     REG_SEG7:       seg7_reg <= wdata[SEG7_W-1:0];
-                    REG_TICK_DIV:   if (!armed) tick_div <= wdata;
+                    REG_TICK_DIV:   if (!armed) begin
+                                        tick_div  <= wdata;
+                                        tick_last <= wdata - 32'd1;
+                                    end
                     REG_IRQ_STATUS: irq_status <= irq_status & ~wdata[IRQ_STATUS_W-1:0];
                     REG_IRQ_ENABLE: irq_enable <= wdata[IRQ_STATUS_W-1:0];
                     REG_CTRL:       if (wdata[CTRL_CLEAR_COUNTERS]) begin
                                         frames_ok  <= 32'h0;
                                         crc_errs   <= 32'h0;
                                         tick_count <= 32'h0;
+                                        enc1_errs  <= 16'h0;
+                                        enc2_errs  <= 16'h0;
                                     end
                     REG_WDT_TICKS:  if (!armed)
                                         wdt_ticks <= (wdata[7:0] == 8'd0) ? 8'd1 : wdata[7:0];
+                    REG_M1_DUTY:    m1_duty <= wdata[M1_DUTY_VALUE_MSB:0];
+                    REG_M2_DUTY:    m2_duty <= wdata[M1_DUTY_VALUE_MSB:0];
+                    REG_DUTY_LIMIT: if (!armed) duty_limit <= wdata[DUTY_LIMIT_VALUE_MSB:0];
                     default: ;
                 endcase
+            end
+
+            // Motor duties: zero whenever disarmed, overriding any write
+            // above, so the first armed step starts from standstill
+            if (!armed) begin
+                m1_duty <= 16'h0;
+                m2_duty <= 16'h0;
             end
         end
     end

@@ -20,7 +20,9 @@ module tb_replay;
         .clk(clk), .sw(16'h0), .btnC(1'b0), .btnU(1'b0), .btnL(1'b0),
         .btnR(1'b0), .btnD(1'b0), .led(led), .seg(seg), .dp(dp), .an(an),
         .spi_sck(sck), .spi_mosi(mosi), .spi_miso(miso), .spi_cs_n(cs_n),
-        .fpga_irq(irq), .loop_tick(tick), .fpga_rst_n(1'b1), .fault_n(fault_n)
+        .fpga_irq(irq), .loop_tick(tick), .fpga_rst_n(1'b1), .fault_n(fault_n),
+        .m1_in1(), .m1_in2(), .m2_in1(), .m2_in2(),
+        .enc1_a(1'b0), .enc1_b(1'b0), .enc2_a(1'b0), .enc2_b(1'b0)
     );
 
     real half_ns = 47.0;   // 10.6 MHz

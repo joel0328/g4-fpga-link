@@ -74,19 +74,34 @@ set_property -dict { PACKAGE_PIN K2 IOSTANDARD LVCMOS33 } [get_ports loop_tick]
 set_property -dict { PACKAGE_PIN H2 IOSTANDARD LVCMOS33 } [get_ports fpga_rst_n]
 set_property -dict { PACKAGE_PIN G3 IOSTANDARD LVCMOS33 } [get_ports fault_n]
 
+## Pmod JB - motors (TB6612FNG IN pins) and encoders
+set_property -dict { PACKAGE_PIN A14 IOSTANDARD LVCMOS33 } [get_ports m1_in1]
+set_property -dict { PACKAGE_PIN A16 IOSTANDARD LVCMOS33 } [get_ports m1_in2]
+set_property -dict { PACKAGE_PIN B15 IOSTANDARD LVCMOS33 } [get_ports m2_in1]
+set_property -dict { PACKAGE_PIN B16 IOSTANDARD LVCMOS33 } [get_ports m2_in2]
+set_property -dict { PACKAGE_PIN A15 IOSTANDARD LVCMOS33 } [get_ports enc1_a]
+set_property -dict { PACKAGE_PIN A17 IOSTANDARD LVCMOS33 } [get_ports enc1_b]
+set_property -dict { PACKAGE_PIN C15 IOSTANDARD LVCMOS33 } [get_ports enc2_a]
+set_property -dict { PACKAGE_PIN C16 IOSTANDARD LVCMOS33 } [get_ports enc2_b]
+
+## Hall encoder outputs are often open collector; a weak pull-up costs nothing
+set_property PULLUP true [get_ports {enc1_a enc1_b enc2_a enc2_b}]
+
 ## Keep CS deasserted and reset released if the MCU wires are unplugged
 set_property PULLUP true [get_ports spi_cs_n]
 set_property PULLUP true [get_ports fpga_rst_n]
 
 ## The SPI inputs are asynchronous to sys_clk (oversampled through 2-flop
 ## synchronizers), so exclude them from timing analysis.
-set_false_path -from [get_ports {spi_sck spi_mosi spi_cs_n fpga_rst_n sw[*] btn*}]
-set_false_path -to   [get_ports {spi_miso fpga_irq loop_tick fault_n led[*] seg[*] dp an[*]}]
+set_false_path -from [get_ports {spi_sck spi_mosi spi_cs_n fpga_rst_n sw[*] btn* enc*}]
+set_false_path -to   [get_ports {spi_miso fpga_irq loop_tick fault_n led[*] seg[*] dp an[*] m1_in* m2_in*}]
 
 ## Mark the synchronizer flops
 set_property ASYNC_REG true [get_cells -hierarchical -filter {NAME =~ *sck_s_reg*}]
 set_property ASYNC_REG true [get_cells -hierarchical -filter {NAME =~ *cs_s_reg*}]
 set_property ASYNC_REG true [get_cells -hierarchical -filter {NAME =~ *mosi_s_reg*}]
+set_property ASYNC_REG true [get_cells -hierarchical -filter {NAME =~ *qa_s_reg*}]
+set_property ASYNC_REG true [get_cells -hierarchical -filter {NAME =~ *qb_s_reg*}]
 
 ## Bitstream settings
 set_property CONFIG_VOLTAGE 3.3 [current_design]

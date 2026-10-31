@@ -151,9 +151,42 @@ static void script(int checking)
     st = fpga_read_burst(&l, FPGA_REG_ARM, rd, 2);
     if (checking) EXPECT(st == FPGA_OK && rd[0] == 0u && rd[1] == 1u,
                          "arm refused, WDT_TICKS 0 -> 1: st=%d %08X %08X", st, rd[0], rd[1]);
-    st = fpga_read_burst(&l, FPGA_REG_SNAP_TICK, rd, 4);
-    if (checking) EXPECT(st == FPGA_OK && rd[0] == 0u && rd[1] == 0u && rd[2] == 0u && rd[3] == 0u,
-                         "snapshot before any tick: st=%d %08X", st, rd[0]);
+    st = fpga_read_burst(&l, FPGA_REG_SNAP_TICK, rd, 8);
+    if (checking) EXPECT(st == FPGA_OK && rd[0] == 0u && rd[1] == 0u && rd[2] == 0u && rd[3] == 0u &&
+                         rd[4] == 0u && rd[5] == 0u && rd[6] == 0u && rd[7] == 0u,
+                         "snapshot before any tick: st=%d %08X %08X", st, rd[0], rd[4]);
+
+    /* 6c. Motor block (map v5) after reset: duties 0, limit 50 %, no encoder
+     * errors. Disarmed, so a duty write is ignored; DUTY_LIMIT can change */
+    st = fpga_read_burst(&l, FPGA_REG_M1_DUTY, rd, 4);
+    if (checking) EXPECT(st == FPGA_OK && rd[0] == 0u && rd[1] == 0u &&
+                         rd[2] == FPGA_DUTY_LIMIT_RESET && rd[3] == 0u,
+                         "motor block after reset: st=%d %08X %08X %08X %08X",
+                         st, rd[0], rd[1], rd[2], rd[3]);
+    wr[0] = 0x0u;                    /* WDT_KICK */
+    wr[1] = (uint32_t)(int32_t)-12345 & FPGA_DUTY_MASK;
+    wr[2] = 12345u;
+    wr[3] = FPGA_DUTY_MAX;           /* DUTY_LIMIT */
+    st = fpga_write_burst(&l, FPGA_REG_WDT_KICK, wr, 4);
+    if (checking) EXPECT(st == FPGA_OK, "kick + duties burst: st=%d", st);
+    st = fpga_read_burst(&l, FPGA_REG_M1_DUTY, rd, 3);
+    if (checking) EXPECT(st == FPGA_OK && rd[0] == 0u && rd[1] == 0u && rd[2] == FPGA_DUTY_MAX,
+                         "duties ignored while disarmed, limit set: st=%d %08X %08X %08X",
+                         st, rd[0], rd[1], rd[2]);
+    st = fpga_motor_set(&l, 2, -100);
+    if (checking) EXPECT(st == FPGA_OK, "fpga_motor_set: st=%d", st);
+    st = fpga_motor_set(&l, 3, 0);
+    if (checking) EXPECT(st == FPGA_ERR_PARAM, "fpga_motor_set motor 3: st=%d", st);
+    {
+        int32_t cnt = -1, dlt = -1;
+        st = fpga_encoder_read(&l, 2, &cnt, &dlt);
+        if (checking) EXPECT(st == FPGA_OK && cnt == 0 && dlt == 0,
+                             "fpga_encoder_read: st=%d %ld %ld", st, (long)cnt, (long)dlt);
+        st = fpga_encoder_read(&l, 0, &cnt, NULL);
+        if (checking) EXPECT(st == FPGA_ERR_PARAM, "fpga_encoder_read enc 0: st=%d", st);
+    }
+    st = fpga_read(&l, FPGA_REG_M2_DUTY, &v);
+    if (checking) EXPECT(st == FPGA_OK && v == 0u, "M2_DUTY after fpga_motor_set (disarmed): st=%d %08X", st, v);
 
     /* 7. Bad arguments are refused without sending a frame */
     st = fpga_read_burst(&l, FPGA_REG_SCRATCH_RAM, rd, 0);

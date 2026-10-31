@@ -21,7 +21,7 @@
 # shares another register's fields (documented, not emitted twice).
 
 [map]
-version    = 4
+version    = 5
 id         = 0x47344650       # "G4FP"
 unmapped   = 0xDEADBEEF       # read value of unmapped addresses
 burst_addr = 0x7F             # frame header escape for bursts, never a register
@@ -34,6 +34,10 @@ WDT_TICKS_RESET = 3           # WDT_TICKS after reset
 LINK_FAULT_ERRS = 4           # rejected frames in a row (while armed) that latch FAULT.LINK
 ARM_SWITCH      = 15          # SW15 is the hardware arm enable
 SNAP_FAULT_LSB  = 8           # SNAP_SAFETY: FAULT_STATUS bits start here
+DUTY_MAX        = 32767       # M1_DUTY/M2_DUTY full scale (Q15: 32767 = 100 %)
+DUTY_LIMIT_RESET = 16384      # DUTY_LIMIT after reset (50 %)
+PWM_HZ          = 20000       # H-bridge PWM frequency
+ENC_FILTER_CLKS = 64          # encoder inputs must be stable this many clocks to count
 
 [[reg]]
 name   = "ID"
@@ -46,7 +50,7 @@ desc   = '0x47344650 ("G4FP")'
 name   = "VERSION"
 addr   = 0x01
 access = "RO"
-reset  = 4
+reset  = 5
 desc   = "{version}"
 
 [[reg]]
@@ -154,7 +158,7 @@ desc   = "Free-running microsecond timestamp"
 name   = "CTRL"
 addr   = 0x0D
 access = "W"
-desc   = "[0] clear FRAMES_OK, CRC_ERRS and TICK_COUNT"
+desc   = "[0] clear FRAMES_OK, CRC_ERRS, TICK_COUNT and ENC_ERRS"
 fields = [
     { name = "CLEAR_COUNTERS", bits = "0" },
 ]
@@ -219,9 +223,51 @@ access = "RW"
 reset  = 0
 desc   = "Any write feeds the watchdog. Read: [7:0] ticks since the last kick (0 while disarmed)"
 
+# ---- Motors (map v5, M3): two sign-magnitude H-bridge channels (TB6612FNG
+# IN1/IN2, 20 kHz PWM on the IN pins) and two quadrature encoders. The duties
+# sit right after WDT_KICK so one burst kicks the watchdog and sets both.
+
+[[reg]]
+name   = "M1_DUTY"
+addr   = 0x25
+access = "RW"
+reset  = 0
+desc   = "[15:0] signed duty, ±32767 = ±100 % (−32768 acts as −32767): positive PWMs IN1, negative IN2, 0 = coast. Clamped to ±DUTY_LIMIT. Reads sign-extended. Held at 0 while disarmed (writes ignored), so arming never starts a motor"
+fields = [
+    { name = "VALUE", bits = "15:0", c = "FPGA_DUTY_MASK" },
+]
+
+[[reg]]
+name   = "M2_DUTY"
+addr   = 0x26
+access = "RW"
+reset  = 0
+desc   = "Same for motor 2"
+
+[[reg]]
+name   = "DUTY_LIMIT"
+addr   = 0x27
+access = "RW"
+reset  = 16384
+desc   = "[14:0] largest |duty| applied to either motor; reset 16384 = 50 %. Writes ignored while armed"
+fields = [
+    { name = "VALUE", bits = "14:0" },
+]
+
+[[reg]]
+name   = "ENC_ERRS"
+addr   = 0x28
+access = "RO"
+reset  = 0
+desc   = "Illegal quadrature transitions (A and B changed together): [15:0] encoder 1, [31:16] encoder 2. Wraps; CTRL[0] clears"
+fields = [
+    { name = "ENC1", bits = "15:0" },
+    { name = "ENC2", bits = "31:16" },
+]
+
 # ---- Snapshot: latched at every LOOP_TICK, published between frames, so a
 # burst read of 0x30.. always returns one consistent sample.
-# 0x34-0x37 reserved for encoders (M3), 0x38-0x3F for the IMU (M5).
+# 0x38-0x3F reserved for the IMU (M5).
 
 [[reg]]
 name   = "SNAP_TICK"
@@ -250,3 +296,31 @@ addr   = 0x33
 access = "RO"
 reset  = 0
 desc   = "ARM read bits in [3:0], FAULT_STATUS in [11:8], at the tick"
+
+[[reg]]
+name   = "SNAP_ENC1_COUNT"
+addr   = 0x34
+access = "RO"
+reset  = 0
+desc   = "Encoder 1 position at the tick: signed 32-bit, 4 counts per encoder line, up when A leads B"
+
+[[reg]]
+name   = "SNAP_ENC1_DELTA"
+addr   = 0x35
+access = "RO"
+reset  = 0
+desc   = "Encoder 1 counts since the previous tick (signed)"
+
+[[reg]]
+name   = "SNAP_ENC2_COUNT"
+addr   = 0x36
+access = "RO"
+reset  = 0
+desc   = "Encoder 2 position at the tick"
+
+[[reg]]
+name   = "SNAP_ENC2_DELTA"
+addr   = 0x37
+access = "RO"
+reset  = 0
+desc   = "Encoder 2 counts since the previous tick"

@@ -7,6 +7,7 @@
     python scripts/serial_monitor.py --list           # show serial ports
     python scripts/serial_monitor.py --reset --arm    # also arm (SW15 must be up); expects armed
     python scripts/serial_monitor.py --cmd 20:k --cmd 25:c   # console bytes at t = 20 s, 25 s
+    python scripts/serial_monitor.py --arm --cmd "5:m25 " --cmd 10:s   # M1 at 25 % from 5 s to 10 s
 
 Needs pyserial (pip install pyserial). Writes everything to build/serial.log
 and ends with a RESULT line:
@@ -44,6 +45,7 @@ SELFTEST_RE = re.compile(r"^\s*(\S.*?): (\d+) iterations in (\d+) ms, mismatches
 STEP_RE = re.compile(r"step: done (\d+), skipped (\d+), errors (\d+), latency (\d+)\.\.(\d+) ns "
                      r"\(avg (\d+)\), callback CPU avg (\d+) ns")
 SAFETY_RE = re.compile(r"safety: (armed|disarmed), SW15 (up|down), kicks (on|off), faults 0x([0-9A-F]+)")
+MOTOR_RE = re.compile(r"motor: M1 duty (-?\d+) .*enc1 (-?\d+), (-?\d+) counts/s .*enc errs (\d+)/(\d+)")
 BOOT_DISARMED = "safety: disarmed; SW15 up"   # the firmware is ready for 'a'
 
 
@@ -160,6 +162,14 @@ def judge(lines, expect_armed=False):
     else:
         checks.append((name, False, "no safety line seen"))
 
+    # Map v5 firmware prints a motor line; older firmware doesn't, so skip then
+    motor = [m for m in (MOTOR_RE.search(l) for l in lines) if m]
+    if motor:
+        m = motor[-1]
+        checks.append(("Encoders: no illegal transitions", m.group(4) == "0" and m.group(5) == "0",
+                       f"M1 duty {m.group(1)}, enc1 {m.group(2)}, {m.group(3)} counts/s, "
+                       f"enc errs {m.group(4)}/{m.group(5)}"))
+
     print("\n--- Bring-up checks ---")
     for name, ok, detail in checks:
         print(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}")
@@ -182,8 +192,8 @@ def main():
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--arm", action="store_true",
                     help="send 'a' once the firmware is up (SW15 must be up) and expect it armed")
-    ap.add_argument("--cmd", action="append", default=[], metavar="SECONDS:CHAR",
-                    help="send a console byte at a time into the run, e.g. 20:k (repeatable)")
+    ap.add_argument("--cmd", action="append", default=[], metavar="SECONDS:TEXT",
+                    help="send console bytes at a time into the run, e.g. 20:k or \"5:m25 \" (repeatable)")
     a = ap.parse_args()
 
     if a.list:
